@@ -1,0 +1,65 @@
+/* Minimal slide base (16:9).
+ *
+ * This base is ALWAYS loaded, but it intentionally provides NO visual component
+ * classes. Step 3 has full creative control and writes its own page-scoped
+ * <style> for each slide. The base only guarantees two things:
+ *   - a fixed page size (.page) for print/PDF fidelity;
+ *   - an Office-friendly font stack applied inside every .page.
+ */
+
+/* A tiny set of tokens the pipeline itself relies on. */
+:root {
+  --paper: #ffffff; /* page background (used by step3 background normalization) */
+  --ink: #101114;   /* default text color */
+}
+
+/* Global reset for predictable print layout. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Fixed page size for all slides (pt). */
+@page {
+  size: 959.76pt 540pt;
+  margin: 0;
+}
+
+/* App canvas background (outside pages). */
+body {
+  background: #e9eaee;
+}
+
+/* .page: root container for each slide (fixed size + page break). */
+.page {
+  width: 959.76pt;
+  height: 540pt;
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  overflow: hidden;
+  page-break-after: always;
+}
+
+/* Font policy: PPTist-compatible fallback at the page root. Descendants may set
+ * their own font-family; this root stack is only the inherited default. */
+.page {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+}
+
+/* Table safety net: a `table-layout:fixed` cell can't widen its column to fit a
+ * long unbreakable token (e.g. a slash-joined Latin run like
+ * "SAP/ServiceNow/OutSystems"), so such content spills horizontally past the
+ * cell border. Force cells (and their block children, via inheritance) to wrap
+ * anywhere as a last resort so content always stays inside its cell. */
+.page td,
+.page th {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
