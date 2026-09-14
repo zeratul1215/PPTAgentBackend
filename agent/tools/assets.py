@@ -23,7 +23,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
 from agent_backend.agent.tools.context import (
-    project_lock,
+    page_lock,
     require_agent_run_id,
     require_project_id,
     require_session_id,
@@ -80,25 +80,20 @@ def stage_page_asset(
     runtime: ToolRuntime,
     user_note: str = "",
 ) -> dict[str, Any]:
-    """Place a chat-uploaded image onto a page, ready for image.add/replace.
+    """Stage a chat-uploaded image for a later operation on one page.
 
-    Call this BEFORE editing a page when the user attached an image they want on
-    that page. `page_ref` is the stable page ref returned by outline/locate.
+    `page_ref` is the stable page ref returned by outline/locate.
     `artifact_ref` is one of the current message's uploaded Artifact refs.
     `user_note` is the user's own words about the image.
 
-    This copies/links the file into the page's asset bundle and records it as pending.
-    Follow up on the SAME page: use `patch_pages(images_involved=True)` for an
-    in-place replacement, `fill_empty_pages` for a blank page, or `edit_pages`
-    when a nonblank page's composition must change.
+    This copies/links the file into the page's asset bundle and records it as
+    pending for a subsequent page operation in the same run.
     """
     pid = require_project_id(runtime)
     sid = require_session_id(runtime)
     uid = require_user_id(runtime)
     run_id = require_agent_run_id(runtime)
     paths = workspace_for(pid)
-    lock = project_lock(pid)
-
     ref = str(artifact_ref or "").strip()
     if not ref:
         return {"project_id": pid, "ok": False, "error": "artifact_ref is required"}
@@ -109,9 +104,11 @@ def stage_page_asset(
     if not src.is_file():
         return {"project_id": pid, "ok": False, "error": "artifact_file_missing"}
 
-    with lock:
-        slot = pageorder.slot_for_page_ref(paths, str(page_ref))
-        if slot is None:
+    slot = pageorder.slot_for_page_ref(paths, str(page_ref))
+    if slot is None:
+        return {"project_id": pid, "ok": False, "error": "page_not_found"}
+    with page_lock(pid, int(slot)):
+        if pageorder.entry_for_slot(paths, int(slot)) is None:
             return {"project_id": pid, "ok": False, "error": "page_not_found"}
         page = pageorder.position_for_slot(paths, int(slot))
 

@@ -40,7 +40,7 @@ import time
 import uuid
 import warnings
 from collections import defaultdict, deque
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -55,7 +55,9 @@ from agent_backend.agent.tools import set_progress_publisher
 from agent_backend.agent.tools.context import (
     create_blank_page_artifacts,
     outline as project_outline,
-    project_lock,
+    page_lock,
+    page_order_lock,
+    project_initialization_lock,
     sync_deck_page_count,
 )
 from agent_backend.agent.tools.manage import deck_summaries
@@ -1079,7 +1081,7 @@ async def initialize_pptist_project(project_id: str, payload: dict[str, Any]):
     if missing:
         raise HTTPException(status_code=400, detail=f"missing slides for slot(s): {missing}")
 
-    lock = project_lock(project_id)
+    lock = project_initialization_lock(project_id)
 
     def _work() -> dict[str, Any]:
         with lock:
@@ -1594,12 +1596,13 @@ async def add_page_endpoint(project_id: str, payload: dict[str, Any]):
     at_position = int(at) if at is not None else None
     title = (_rj(paths.project_manifest_json()) or {}).get("title") or "PPTAgent"
 
-    lock = project_lock(project_id)
+    lock = page_order_lock(project_id)
 
     def _work() -> dict[str, Any]:
         with lock:
             res = _add(paths, at_position=at_position, origin="scratch")
-            create_blank_page_artifacts(paths, int(res["slot"]), title=title)
+            with page_lock(project_id, int(res["slot"])):
+                create_blank_page_artifacts(paths, int(res["slot"]), title=title)
             return res
 
     res = await asyncio.to_thread(_work)
@@ -1628,7 +1631,7 @@ async def add_slides_endpoint(project_id: str, payload: dict[str, Any]):
     from agent_backend.workspace.assets import materialize_pptist_slide_assets
 
     title = (_rj(paths.project_manifest_json()) or {}).get("title") or "PPTAgent"
-    lock = project_lock(project_id)
+    lock = page_order_lock(project_id)
 
     def _work() -> dict[str, Any]:
         with lock:
@@ -1646,10 +1649,11 @@ async def add_slides_endpoint(project_id: str, payload: dict[str, Any]):
                     continue
                 res = _add(paths, at_position=insert_at, origin="scratch")
                 slot = int(res["slot"])
-                create_blank_page_artifacts(paths, slot, title=title)
-                payload = _clean_slide_payload(raw)
-                _wj(paths.pptist_slide_json(slot), payload)
-                materialize_pptist_slide_assets(paths, slot, payload)
+                with page_lock(project_id, slot):
+                    create_blank_page_artifacts(paths, slot, title=title)
+                    payload = _clean_slide_payload(raw)
+                    _wj(paths.pptist_slide_json(slot), payload)
+                    materialize_pptist_slide_assets(paths, slot, payload)
                 slide = dict(raw)
                 slide["id"] = _slide_id_for_slot(slot)
                 added.append({"slot": slot, "position": res["position"], "slide": slide})
@@ -1676,14 +1680,15 @@ async def delete_page_endpoint(project_id: str, slot: int):
     paths = _project_paths(project_id)
     from agent_backend.workspace.pageorder import delete_slots, page_count
 
-    if page_count(paths) <= 1:
-        raise HTTPException(status_code=400, detail="cannot delete the last page")
-
-    lock = project_lock(project_id)
+    page_guard = page_lock(project_id, int(slot))
+    order_guard = page_order_lock(project_id)
 
     def _work() -> dict[str, Any]:
-        with lock:
-            return delete_slots(paths, [int(slot)])
+        with page_guard:
+            with order_guard:
+                if page_count(paths) <= 1:
+                    raise HTTPException(status_code=400, detail="cannot delete the last page")
+                return delete_slots(paths, [int(slot)])
 
     res = await asyncio.to_thread(_work)
     if not res.get("removed"):
@@ -1722,7 +1727,7 @@ async def reorder_pages_endpoint(project_id: str, payload: dict[str, Any]):
     except Exception:
         raise HTTPException(status_code=400, detail="base_revision must be an integer")
 
-    lock = project_lock(project_id)
+    lock = page_order_lock(project_id)
 
     def _work() -> dict[str, Any]:
         with lock:
@@ -1919,15 +1924,20 @@ def _save_deck_slides(
     saved: list[int] = []
     skipped: list[int] = []
     for slot, slide in slides_by_slot.items():
-        if int(slot) not in known or not isinstance(slide, dict):
-            skipped.append(int(slot))
+        slot = int(slot)
+        if slot not in known or not isinstance(slide, dict):
+            skipped.append(slot)
             continue
-        # Drop the transient id; it is re-derived from the slot on read, so the
-        # stored JSON never disagrees with the slot<->slide mapping.
-        payload = {k: v for k, v in slide.items() if k != "id"}
-        write_json(paths.pptist_slide_json(int(slot)), payload)
-        materialize_pptist_slide_assets(paths, int(slot), payload)
-        saved.append(int(slot))
+        with page_lock(project_id, slot):
+            if slot not in {int(e["slot"]) for e in ordered_entries(paths)}:
+                skipped.append(slot)
+                continue
+            # Drop the transient id; it is re-derived from the slot on read, so
+            # the stored JSON never disagrees with the slot<->slide mapping.
+            payload = {k: v for k, v in slide.items() if k != "id"}
+            write_json(paths.pptist_slide_json(slot), payload)
+            materialize_pptist_slide_assets(paths, slot, payload)
+            saved.append(slot)
 
     return {
         "saved": sorted(saved),
@@ -1975,10 +1985,14 @@ def _stage_deck_slides(
             raise HTTPException(status_code=400, detail=f"invalid slide JSON for slot {slot}: {exc}")
         if not isinstance(slide, dict):
             raise HTTPException(status_code=400, detail=f"slide JSON for slot {slot} must be an object")
-        dst = paths.staged_pptist_slide_json(slot, content_hash)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        write_json(dst, _clean_slide_payload(slide))
-        staged.append(slot)
+        with page_lock(project_id, slot):
+            if slot not in {int(e["slot"]) for e in ordered_entries(paths)}:
+                skipped.append(slot)
+                continue
+            dst = paths.staged_pptist_slide_json(slot, content_hash)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            write_json(dst, _clean_slide_payload(slide))
+            staged.append(slot)
 
     return {"staged": sorted(staged), "skipped": sorted(skipped)}
 
@@ -2055,20 +2069,24 @@ def _save_reread_images(
     known = {int(e["slot"]) for e in ordered_entries(paths)}
     saved: list[int] = []
     for slot, raw in images_by_slot.items():
-        if int(slot) not in known or not raw:
+        slot = int(slot)
+        if slot not in known or not raw:
             continue
-        content_hash = (hashes_by_slot or {}).get(int(slot))
-        dst = (
-            paths.staged_reread_page_png(int(slot), content_hash)
-            if content_hash
-            else paths.reread_page_png(int(slot))
-        )
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            dst.write_bytes(raw)
-        except OSError:
-            continue
-        saved.append(int(slot))
+        with page_lock(project_id, slot):
+            if slot not in {int(e["slot"]) for e in ordered_entries(paths)}:
+                continue
+            content_hash = (hashes_by_slot or {}).get(slot)
+            dst = (
+                paths.staged_reread_page_png(slot, content_hash)
+                if content_hash
+                else paths.reread_page_png(slot)
+            )
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dst.write_bytes(raw)
+            except OSError:
+                continue
+            saved.append(slot)
     return sorted(saved)
 
 
@@ -2149,19 +2167,22 @@ async def mark_reread_ready(project_id: str, payload: dict[str, Any]):
             continue
         if slot not in known:
             continue
-        content_hash = raw.get("content_hash")
-        if isinstance(content_hash, str) and content_hash:
-            staged_json = paths.staged_pptist_slide_json(slot, content_hash)
-            staged_png = paths.staged_reread_page_png(slot, content_hash)
-            if not staged_json.exists() or not staged_png.exists():
+        with page_lock(project_id, slot):
+            if slot not in {int(e["slot"]) for e in ordered_entries(paths)}:
                 continue
-            slide = _read_json(staged_json)
-            _write_json(paths.pptist_slide_json(slot), slide)
-            materialize_pptist_slide_assets(paths, slot, slide)
-            shutil.copyfile(staged_png, paths.reread_page_png(slot))
-            clear_staged_candidates(paths, slot)
-        elif not paths.reread_page_png(slot).exists():
-            continue
-        mark_pending_reread(paths, slot)
-        marked.append(slot)
+            content_hash = raw.get("content_hash")
+            if isinstance(content_hash, str) and content_hash:
+                staged_json = paths.staged_pptist_slide_json(slot, content_hash)
+                staged_png = paths.staged_reread_page_png(slot, content_hash)
+                if not staged_json.exists() or not staged_png.exists():
+                    continue
+                slide = _read_json(staged_json)
+                _write_json(paths.pptist_slide_json(slot), slide)
+                materialize_pptist_slide_assets(paths, slot, slide)
+                shutil.copyfile(staged_png, paths.reread_page_png(slot))
+                clear_staged_candidates(paths, slot)
+            elif not paths.reread_page_png(slot).exists():
+                continue
+            mark_pending_reread(paths, slot)
+            marked.append(slot)
     return {"ok": True, "project_id": project_id, "marked": sorted(marked)}

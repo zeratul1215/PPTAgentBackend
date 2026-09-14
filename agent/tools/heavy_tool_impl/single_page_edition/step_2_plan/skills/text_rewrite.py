@@ -20,6 +20,7 @@ from .base import (
     _flatten_to_segment_items,
     _get_segments,
     _set_segments,
+    _text_targets,
 )
 
 
@@ -97,21 +98,21 @@ def _run_rewrite(
     objective = str(intent.get("objective") or "").strip()
     if not objective:
         warnings.append(f"rewrite_empty_objective[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
-    texts: list[dict[str, Any]] = state.get("texts") or []
+    texts: list[dict[str, Any]] = _text_targets(state)
     by_id: dict[str, dict[str, Any]] = {str(t.get("id") or ""): t for t in texts if isinstance(t, dict)}
     all_ids = _all_text_ids(by_id)
     if not all_ids:
         warnings.append(f"rewrite_no_text_on_page[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     seg_items, seg_map, _seg_counts = _flatten_to_segment_items(
         ids=all_ids, by_id=by_id, selected=None
     )
     if not seg_items:
         warnings.append(f"rewrite_empty_segment_items[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     if dry_run:
         # Dry-run cannot resolve scope semantically; stub-rewrite everything so
@@ -128,7 +129,7 @@ def _run_rewrite(
             segs[idx] = f"[rewrite] {str(it.get('text') or '')}"
             _set_segments(node, segs)
         warnings.append(f"dry_run_stub_rewrite: {iid}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="applied", triggered_visual=False)
 
     payload = {
         "user_request": user_request,
@@ -145,10 +146,10 @@ def _run_rewrite(
     )
     if err:
         warnings.append(f"rewrite_call_error[{iid}]: {err}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
     if not isinstance(obj, dict) or not isinstance(obj.get("paragraphs"), list):
         warnings.append(f"rewrite_invalid_response[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     known_seg_ids = set(seg_map.keys())
     seen_ids: set[str] = set()
@@ -181,35 +182,33 @@ def _run_rewrite(
             segs = _get_segments(node) or [str(node.get("text") or "")]
             while len(segs) <= idx:
                 segs.append("")
+            if segs[idx] == tgt_text:
+                continue
             segs[idx] = tgt_text
             _set_segments(node, segs)
             touched += 1
 
     if touched == 0:
-        warnings.append(f"rewrite_selected_nothing[{iid}]")
+        if seen_ids:
+            warnings.append(f"rewrite_no_change[{iid}]")
+            status = "already_satisfied"
+        else:
+            warnings.append(f"rewrite_selected_nothing[{iid}]")
+            status = "failed"
     else:
         warnings.append(f"rewrite_applied[{iid}]: {touched} segments")
+        status = "applied"
     # Rewrite keeps one fragment per source (no element-set change); it does not
     # force a visual re-flow on its own.
-    return SkillResult(warnings=warnings, triggered_visual=False)
+    return SkillResult(warnings=warnings, status=status, triggered_visual=False)
 
 
-_REWRITE_PLAN_DOC = """  Rewrite text IN THE SAME LANGUAGE (never translates). Use for
-  "改得更简洁/更正式/换成标题式/口语化/营销化/学术化/精简到 N 字".
-  `objective` (natural language) MUST say BOTH:
-    - WHICH text to rewrite (by content/role/position, e.g. "the main title",
-      "the body paragraphs on the right"); and
-    - HOW to rewrite it (the target style / tone / length, e.g. "make it more
-      concise and punchy", "headline style, ≤ 12 characters").
-  No `params` — the executor selects the target text and infers the style from
-  your objective. Does NOT trigger a visual re-layout on its own."""
-
-
-_REWRITE_ORDERING_NOTE = (
-    "When combined with translate, rewriting usually happens BEFORE translate so "
-    "the translation is made from the FINAL polished source text. Preference, not "
-    "a rule — follow the user's stated order if they give one."
-)
+_REWRITE_PLAN_DOC = """  Capability: rewrite existing text in the same language.
+  The natural-language objective must identify the target by visible content,
+  semantic role, or position, and state the intended tone, style, or length.
+  Targets may be ordinary text, Shape-contained text, or visible table-cell
+  text, and the executor writes directly to the corresponding native field.
+  This capability does not itself define a visual re-layout."""
 
 
 SKILL = Skill(
@@ -219,5 +218,5 @@ SKILL = Skill(
     plan_doc=_REWRITE_PLAN_DOC,
     repair=_repair_rewrite_params,
     execute=_run_rewrite,
-    ordering_note=_REWRITE_ORDERING_NOTE,
+    ordering_note="Usually precedes translation of the same content so the final rewritten source is translated.",
 )

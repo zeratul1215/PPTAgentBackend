@@ -15,6 +15,7 @@ tool calls accordingly and each call re-reads the current order.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from typing import Any
 
 from langchain.tools import ToolRuntime
@@ -23,7 +24,8 @@ from langchain_core.tools import tool
 from agent_backend.agent.tools.context import (
     create_blank_page_artifacts,
     emit,
-    project_lock,
+    page_lock,
+    page_order_lock,
     require_project_id,
     sync_deck_page_count,
     workspace_for,
@@ -46,15 +48,21 @@ def delete_pages(page_refs: list[str], runtime: ToolRuntime) -> dict[str, Any]:
     """
     pid = require_project_id(runtime)
     paths = workspace_for(pid)
-    lock = project_lock(pid)
-
-    with lock:
-        slots = [pageorder.slot_for_page_ref(paths, str(ref)) for ref in page_refs or []]
-        missing = [ref for ref, slot in zip(page_refs or [], slots) if slot is None]
-        slots = [int(s) for s in slots if s is not None]
-        if not slots:
-            return {"project_id": pid, "ok": False, "error": "no matching pages to delete", "missing": missing}
-        res = pageorder.delete_slots(paths, slots)
+    slots = [pageorder.slot_for_page_ref(paths, str(ref)) for ref in page_refs or []]
+    missing = [ref for ref, slot in zip(page_refs or [], slots) if slot is None]
+    slots = [int(s) for s in slots if s is not None]
+    if not slots:
+        return {"project_id": pid, "ok": False, "error": "no matching pages to delete", "missing": missing}
+    with ExitStack() as stack:
+        for slot in sorted(set(slots)):
+            stack.enter_context(page_lock(pid, slot))
+        with page_order_lock(pid):
+            slots = [pageorder.slot_for_page_ref(paths, str(ref)) for ref in page_refs or []]
+            missing = [ref for ref, slot in zip(page_refs or [], slots) if slot is None]
+            slots = [int(s) for s in slots if s is not None]
+            if not slots:
+                return {"project_id": pid, "ok": False, "error": "no matching pages to delete", "missing": missing}
+            res = pageorder.delete_slots(paths, slots)
 
     sync_deck_page_count(pid)
     emit(pid, {"type": "pages_changed", "project_id": pid, "op": "delete"})
@@ -80,7 +88,6 @@ def add_page(runtime: ToolRuntime, at_position: int | None = None) -> dict[str, 
     """
     pid = require_project_id(runtime)
     paths = workspace_for(pid)
-    lock = project_lock(pid)
     # Agent-created blank pages are normally followed by style-guided full
     # pipeline content generation, so preflight the project style before
     # mutating page order. Manual frontend blank-page insertion uses the HTTP
@@ -91,7 +98,7 @@ def add_page(runtime: ToolRuntime, at_position: int | None = None) -> dict[str, 
 
     title = (read_json(paths.project_manifest_json()) or {}).get("title") or "PPTAgent"
 
-    with lock:
+    with page_order_lock(pid):
         res = pageorder.add_page(
             paths,
             at_position=int(at_position) if at_position is not None else None,
@@ -122,9 +129,7 @@ def move_page(page_ref: str, to_page: int, runtime: ToolRuntime) -> dict[str, An
     """
     pid = require_project_id(runtime)
     paths = workspace_for(pid)
-    lock = project_lock(pid)
-
-    with lock:
+    with page_order_lock(pid):
         slot = pageorder.slot_for_page_ref(paths, str(page_ref))
         if slot is None:
             return {"project_id": pid, "ok": False, "error": "page_not_found"}

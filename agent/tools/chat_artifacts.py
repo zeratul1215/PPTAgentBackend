@@ -29,9 +29,8 @@ def inspect_chat_artifacts(
 ) -> dict[str, Any]:
     """Inspect images attached to the current user message and return text.
 
-    Use this when a user uploaded images and you need visual details before
-    answering, staging, or deciding how to edit a page. The tool only returns a
-    concise description; it never exposes file paths or base64.
+    Inspects selected chat-uploaded images for a focused visual question and
+    returns a concise description. It never exposes file paths or base64.
     """
 
     sid = require_session_id(runtime)

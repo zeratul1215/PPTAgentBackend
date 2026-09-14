@@ -50,13 +50,17 @@ def _load_step_modules():
 # ---------------------------------------------------------------------------
 
 
-def run_step1(*, understand_input: dict[str, Any], model: str, dry_run: bool) -> dict[str, Any]:
+def run_step1(
+    *, understand_input: dict[str, Any], model: str, dry_run: bool,
+    focus_requests: list[str] | None = None,
+) -> dict[str, Any]:
     s1, *_ = _load_step_modules()
     return s1.understand_step(
         input_obj=understand_input,
         api_key=None,
         model=model,
         dry_run=dry_run,
+        focus_requests=focus_requests,
     )
 
 
@@ -70,6 +74,7 @@ def run_step2(
     user_request: str,
     understand_output: dict[str, Any],
     selected_refs: list[str] | None = None,
+    previous_html_available: bool = False,
     model: str,
     dry_run: bool,
 ) -> dict[str, Any]:
@@ -78,12 +83,14 @@ def run_step2(
         "user_request": str(user_request or ""),
         "selected_refs": list(selected_refs or []),
         "understand_output": understand_output,
+        "previous_html_available": bool(previous_html_available),
     }
     return s2.step2_run(
         request_obj=request_obj,
         api_key=None,
         model=model,
         dry_run=dry_run,
+        previous_html_available=bool(previous_html_available),
     )
 
 
@@ -326,6 +333,14 @@ def run_step3_single_page(
             "severity": "none",
             "repair_applied": False,
         }
+        if visual_self_check.get("status") in {"unavailable", "error"}:
+            raise RuntimeError("step3 visual self-check unavailable")
+        if (
+            visual_self_check.get("verdict") == "revise"
+            and visual_self_check.get("severity") == "major"
+            and not visual_self_check.get("repair_applied")
+        ):
+            raise RuntimeError("step3 visual self-check found an unrepaired major issue")
         repaired_block = str(check.get("page_block") or page_block)
         if repaired_block and repaired_block != page_block:
             final_html = _build_chunk_html(page_block=repaired_block, base_href=base_href, title=title, s3_mod=s3)

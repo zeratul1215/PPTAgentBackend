@@ -23,6 +23,7 @@ from .base import (
     _flatten_to_segment_items,
     _get_segments,
     _set_segments,
+    _text_targets,
 )
 
 
@@ -125,25 +126,25 @@ def _run_translate(
     objective = str(intent.get("objective") or "").strip()
     if not objective:
         warnings.append(f"translate_empty_objective[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
-    texts: list[dict[str, Any]] = state.get("texts") or []
+    texts: list[dict[str, Any]] = _text_targets(state)
     by_id: dict[str, dict[str, Any]] = {str(t.get("id") or ""): t for t in texts if isinstance(t, dict)}
     all_ids = _all_text_ids(by_id)
     if not all_ids:
         warnings.append(f"translate_no_text_on_page[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     seg_items, seg_map, _seg_counts = _flatten_to_segment_items(
         ids=all_ids, by_id=by_id, selected=None
     )
     if not seg_items:
         warnings.append(f"translate_empty_segment_items[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     if dry_run:
         warnings.append(f"dry_run_stub_translate: {iid}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="already_satisfied", triggered_visual=False)
 
     payload = {
         "user_request": user_request,
@@ -160,12 +161,17 @@ def _run_translate(
     )
     if err:
         warnings.append(f"translate_call_error[{iid}]: {err}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
     if not isinstance(obj, dict) or not isinstance(obj.get("paragraphs"), list):
         warnings.append(f"translate_invalid_response[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     known_seg_ids = set(seg_map.keys())
+    before_content = json.dumps(
+        {"texts": state.get("texts") or [], "tables": state.get("tables") or []},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     seen_ids: set[str] = set()
     # Collect per-node replacements and per-node bilingual additions.
     replace_by_tid: dict[str, dict[int, str]] = {}
@@ -222,47 +228,43 @@ def _run_translate(
                 tgt_segments=tgt_segments,
             )
 
-    touched = len(seen_ids)
-    if touched == 0:
+    selected = len(seen_ids)
+    changed = before_content != json.dumps(
+        {"texts": state.get("texts") or [], "tables": state.get("tables") or []},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    if selected == 0:
         warnings.append(f"translate_selected_nothing[{iid}]")
+        status = "failed"
+    elif not changed:
+        warnings.append(f"translate_no_change[{iid}]")
+        status = "already_satisfied"
     else:
         warnings.append(
-            f"translate_applied[{iid}]: {touched} segments "
+            f"translate_applied[{iid}]: {selected} segments "
             f"(replace={sum(len(v) for v in replace_by_tid.values())}, "
             f"bilingual={sum(len(v) for v in bilingual_by_tid.values())})"
         )
+        status = "applied"
     # Bilingual roughly doubles text volume → request a visual re-flow AND supply
     # a default bilingual layout (adopted only if the user gave no visual
     # requirement for this intent). Pure replacement keeps volume → neither.
-    triggered_visual = bool(bilingual_by_tid)
+    triggered_visual = bool(bilingual_by_tid) and changed
     return SkillResult(
         warnings=warnings,
+        status=status,
         triggered_visual=triggered_visual,
         default_visual_detail=_BILINGUAL_VISUAL_DEFAULT if triggered_visual else None,
     )
 
 
-_TRANSLATE_PLAN_DOC = """  Translate text into another language. Use for "翻译成英文/日文", "做成中英双语",
-  "add an English translation".
-  `objective` (natural language) MUST say: WHICH text to translate (by content/
-  role/position, or "the whole page"), the TARGET language, and whether the
-  result is BILINGUAL (keep source + add translation) or a REPLACEMENT (overwrite
-  the source). Examples:
-    - "Make the whole page bilingual: keep the Chinese and add an English
-      translation of every item."   (bilingual)
-    - "Translate the title into Japanese, replacing the original."  (replace)
-  No `params` — the executor selects the target text and the bilingual/replace
-  mode from your objective (it may even use different modes for different parts if
-  your objective says so). Bilingual mode DOES request a visual re-layout;
-  pure replacement does NOT."""
-
-
-_TRANSLATE_ORDERING_NOTE = (
-    "Usually runs LAST among content edits: translate the FINAL text, after any "
-    "redaction (so masked spans aren't translated) and any rewrite (so the "
-    "polished wording is what gets translated). Preference, not a rule — honor "
-    "the user's explicit order if they state one."
-)
+_TRANSLATE_PLAN_DOC = """  Capability: translate existing text. The natural-language
+  objective must identify the target, target language, and whether source text is
+  retained alongside the translation or replaced. The executor selects matching
+  ordinary text, Shape-contained text, or visible table-cell text and writes back
+  to the corresponding native field. It can use different modes for different
+  targets when required. Retaining both languages may require visual re-layout."""
 
 
 SKILL = Skill(
@@ -272,5 +274,5 @@ SKILL = Skill(
     plan_doc=_TRANSLATE_PLAN_DOC,
     repair=_repair_translate_params,
     execute=_run_translate,
-    ordering_note=_TRANSLATE_ORDERING_NOTE,
+    ordering_note="Usually follows source-language redaction or rewriting when they affect the same content.",
 )

@@ -20,6 +20,7 @@ from .base import (
     _flatten_to_segment_items,
     _get_segments,
     _set_segments,
+    _text_targets,
 )
 
 
@@ -123,32 +124,32 @@ def _run_redact(
     objective = str(intent.get("objective") or "").strip()
     if not objective:
         warnings.append(f"redact_empty_objective[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
     replacement = "<REDACTED>"
 
-    texts: list[dict[str, Any]] = state.get("texts") or []
+    texts: list[dict[str, Any]] = _text_targets(state)
     by_id: dict[str, dict[str, Any]] = {str(t.get("id") or ""): t for t in texts if isinstance(t, dict)}
     all_ids = _all_text_ids(by_id)
     if not all_ids:
         warnings.append(f"redact_no_text_on_page[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     seg_items, seg_map, _seg_counts = _flatten_to_segment_items(
         ids=all_ids, by_id=by_id, selected=None
     )
     if not seg_items:
         warnings.append(f"redact_empty_segment_items[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     if dry_run:
         warnings.append(f"dry_run_stub_redact: {iid}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="already_satisfied", triggered_visual=False)
 
     payload = {
         "user_request": user_request,
         "objective": objective,
         "replacement": replacement,
-        "items": [{"id": str(it.get("id") or ""), "text": str(it.get("text") or "")} for it in seg_items],
+        "items": seg_items,
     }
     raw, obj, err = _call_claude_json(
         model=model,
@@ -160,10 +161,10 @@ def _run_redact(
     )
     if err:
         warnings.append(f"redact_call_error[{iid}]: {err}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
     if not isinstance(obj, dict) or not isinstance(obj.get("items"), list):
         warnings.append(f"redact_invalid_response[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     known_seg_ids = set(seg_map.keys())
     seg_text_by_id = {str(it.get("id") or ""): str(it.get("text") or "") for it in seg_items}
@@ -211,27 +212,20 @@ def _run_redact(
 
     if touched == 0:
         warnings.append(f"redact_selected_nothing[{iid}]")
+        status = "failed"
     else:
         warnings.append(f"redact_applied[{iid}]: {touched} segments")
+        status = "applied"
     # Redaction masks spans but keeps the element set and rough sizes; no re-flow.
-    return SkillResult(warnings=warnings, triggered_visual=False)
+    return SkillResult(warnings=warnings, status=status, triggered_visual=False)
 
 
-_REDACT_PLAN_DOC = """  Redact / mask sensitive spans in text (does NOT translate or rewrite unrelated
-  words). Use for "打码/脱敏/隐藏公司名/hide the emails".
-  `objective` (natural language) MUST say WHICH text to scan (by content/role/
-  position, or "the whole page") AND what to mask (e.g. "mask all organization
-  names", "hide every email address", or a specific literal like "remove the
-  string 'Acme Corp'"). No `params` — the executor finds both the scope and the
-  spans. Does NOT trigger a visual re-layout on its own."""
-
-
-_REDACT_ORDERING_NOTE = (
-    "Usually runs BEFORE any skill that re-emits or copies the text (rewrite, "
-    "translate), so sensitive spans are removed before they can be rewritten or "
-    "duplicated into another language. This is a safety concern, not just a style "
-    "preference — keep redaction first unless the user explicitly wants otherwise."
-)
+_REDACT_PLAN_DOC = """  Capability: mask specified sensitive spans while leaving
+  unrelated wording unchanged. The natural-language objective must identify the
+  text scope and the information or literal content to mask. The executor locates
+  both scope and spans across ordinary text, Shape-contained text, and visible
+  table-cell text, then writes directly to the native field. This capability does
+  not itself define a visual re-layout."""
 
 
 SKILL = Skill(
@@ -241,6 +235,6 @@ SKILL = Skill(
     plan_doc=_REDACT_PLAN_DOC,
     repair=_repair_redact_params,
     execute=_run_redact,
-    ordering_note=_REDACT_ORDERING_NOTE,
+    ordering_note="Usually precedes capabilities that rewrite, copy, or translate the same content so masked information is not propagated.",
     hard_before=frozenset({"text.rewrite", "text.translate"}),
 )

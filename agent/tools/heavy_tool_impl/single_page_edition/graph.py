@@ -29,6 +29,7 @@ from agent_backend.workspace.paths import (
     write_json,
     write_text,
 )
+from agent_backend.workspace.html_lineage import write_lineage
 from .reread import _materialize_images
 from .steps import (
     run_beautify_reference_image,
@@ -74,6 +75,7 @@ class PipelineState(TypedDict, total=False):
     # to the right page/task without the frontend having to map slot->position.
     display_page: int
     batch_index: int
+    agent_run_id: str
 
     # State files
     current_page_state: dict[str, Any]
@@ -145,6 +147,7 @@ def _emit_progress(state: PipelineState, stage: str) -> None:
             "page": page,
             "slot": int(state.get("page_num") or 0),
             "index": index,
+            "agent_run_id": str(state.get("agent_run_id") or ""),
             "stage": stage,
             "label": _STAGE_LABELS.get(stage, stage),
         },
@@ -733,6 +736,15 @@ def commit_turn_html_to_pptist(
         "at": time.time(),
     }
     write_json(turn_dir / "commit_result.json", commit)
+    try:
+        write_lineage(
+            paths, page_num, source_turn=turn_dir.name,
+            final_html_path=str(html_path), slide=slide,
+        )
+    except Exception:
+        # Lineage is an optimization only; never turn a committed page into a
+        # failed edit because its optional sidecar could not be written.
+        pass
     return commit
 
 
@@ -749,10 +761,34 @@ def node_commit_to_preview(state: PipelineState) -> PipelineState:
         step3_result=state.get("step3_result") or {},
         title=str(state.get("title") or "PPTAgent"),
     )
+    if _step2_consumed_uploads(state.get("step2_output")):
+        from agent_backend.workspace.assets import consume_pending_uploads_for_run
+
+        consume_pending_uploads_for_run(
+            paths,
+            int(state["page_num"]),
+            str(state.get("agent_run_id") or ""),
+        )
     return {
         "commit_result": commit,
         "branch_artefacts": {"commit": commit},
     }
+
+
+def _step2_consumed_uploads(step2_output: Any) -> bool:
+    if not isinstance(step2_output, dict):
+        return False
+    plan = step2_output.get("plan")
+    compile_out = step2_output.get("compile")
+    if not isinstance(plan, dict) or not isinstance(compile_out, dict):
+        return False
+    executed = {str(value) for value in compile_out.get("executed_intent_ids") or []}
+    return any(
+        isinstance(intent, dict)
+        and str(intent.get("id") or "") in executed
+        and str(intent.get("skill") or "") in {"image.add", "image.replace"}
+        for intent in plan.get("content_intents") or []
+    )
 
 
 def node_finalize(state: PipelineState) -> PipelineState:
@@ -834,6 +870,7 @@ def run_pipeline_once(
     understanding_status: str = "cached",
     deck_style: dict[str, Any] | None = None,
     deck_style_revision: int = 0,
+    agent_run_id: str = "",
 ) -> dict[str, Any]:
     """Run one task through the pipeline and return the final state.
 
@@ -850,6 +887,7 @@ def run_pipeline_once(
         "title": title,
         "display_page": int(display_page if display_page is not None else page_num),
         "batch_index": int(batch_index),
+        "agent_run_id": str(agent_run_id or ""),
         "current_page_state": current_page_state or {},
         "understanding_status": str(understanding_status or "cached"),
         "deck_style": deck_style or {},

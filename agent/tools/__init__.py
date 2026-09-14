@@ -26,11 +26,11 @@ immediately.
 
 from __future__ import annotations
 
+import os
+
 from agent_backend.agent.tools.assets import stage_page_asset
 from agent_backend.agent.tools.chat_artifacts import inspect_chat_artifacts
 from agent_backend.agent.tools.context import AgentContext, set_progress_publisher
-from agent_backend.agent.tools.edit import edit_pages
-from agent_backend.agent.tools.fill import fill_empty_pages
 from agent_backend.agent.tools.deck_style import get_deck_style
 from agent_backend.agent.tools.patch import patch_pages
 from agent_backend.agent.tools.inspect import (
@@ -41,6 +41,21 @@ from agent_backend.agent.tools.manage import list_decks, set_active_deck
 from agent_backend.agent.tools.page_understanding import understand_pages
 from agent_backend.agent.tools.pages import add_page, delete_pages, move_page
 from agent_backend.agent.tools.progress import report_progress
+
+
+def _with_reference_image_enabled() -> bool:
+    value = os.environ.get("PPT_PIPELINE_WITH_REFERENCE_IMAGE", "0").strip().lower()
+    return value in {"1", "true", "yes", "on", "with", "with_reference_image"}
+
+
+if _with_reference_image_enabled():
+    from agent_backend.agent.tools.edit import edit_pages
+    from agent_backend.agent.tools.fill import fill_empty_pages
+    PIPELINE_VARIANT = "with_reference_image"
+else:
+    from agent_backend.agent.tools.pipeline_without_reference_image.edit import edit_pages
+    from agent_backend.agent.tools.pipeline_without_reference_image.fill import fill_empty_pages
+    PIPELINE_VARIANT = "without_reference_image"
 
 ALL_TOOLS = [
     list_decks,

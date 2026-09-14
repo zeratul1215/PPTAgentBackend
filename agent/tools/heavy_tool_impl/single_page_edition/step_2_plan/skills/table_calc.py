@@ -1,6 +1,5 @@
-"""Deterministic table helpers: a CLOSED set of enumerated numeric operators
-plus the shared grid utilities that `table.build` / `table.reshape` /
-`table.compute` all rely on.
+"""Deterministic calculation helpers: a CLOSED set of enumerated numeric
+operators plus numeric parsing utilities used by `data.calculate` and Patch.
 
 Design guardrails (see changelog 2026-07-21_03):
 - **No formula-string evaluation.** The model only ever picks an enumerated
@@ -9,89 +8,14 @@ Design guardrails (see changelog 2026-07-21_03):
 - **Closed operator set.** `OPERATORS` below is the whole vocabulary. Adding a
   capability = adding one named function here, never accepting arbitrary code.
 
-The grid helpers resolve a table cell to its display text using the SAME rule
-step3 renders by: when one text node is a whole column (one segment per row),
-the cell at that row maps to that node's row-th segment; otherwise a cell maps
-to its node's full text.
+All callers now read native TableSpec cells directly. This module owns only
+numeric parsing, formatting, and the closed arithmetic operator set.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Optional
-
-from .base import _get_segments
-
-
-# ---------------------------------------------------------------------------
-# Grid utilities (shared by build / reshape / compute)
-# ---------------------------------------------------------------------------
-
-
-def cells_of(table: dict[str, Any]) -> list[dict[str, Any]]:
-    cells = table.get("cells")
-    return [c for c in cells if isinstance(c, dict)] if isinstance(cells, list) else []
-
-
-def column_cells(table: dict[str, Any], col: int) -> list[dict[str, Any]]:
-    """Cells in `col`, sorted by row (row-major within the column)."""
-    out = [c for c in cells_of(table) if _as_int(c.get("col")) == col]
-    out.sort(key=lambda c: _as_int(c.get("row")))
-    return out
-
-
-def row_cells(table: dict[str, Any], row: int) -> list[dict[str, Any]]:
-    out = [c for c in cells_of(table) if _as_int(c.get("row")) == row]
-    out.sort(key=lambda c: _as_int(c.get("col")))
-    return out
-
-
-def cell_display_text(
-    table: dict[str, Any],
-    row: int,
-    col: int,
-    by_id: dict[str, dict[str, Any]],
-) -> Optional[str]:
-    """Resolve the visible text of cell (row, col).
-
-    Mirrors step3's data-ref rule: if this cell's `ref` is shared by several
-    cells in the SAME column (one text node spanning the column, one segment per
-    row), return that node's segment at this row's position; otherwise return the
-    node's whole text. Returns None when the cell or its node is missing.
-    """
-    target = None
-    for c in cells_of(table):
-        if _as_int(c.get("row")) == row and _as_int(c.get("col")) == col:
-            target = c
-            break
-    if target is None:
-        return None
-    ref = str(target.get("ref") or "")
-    node = by_id.get(ref)
-    if not isinstance(node, dict):
-        return None
-
-    same_ref_in_col = [
-        c for c in column_cells(table, col) if str(c.get("ref") or "") == ref
-    ]
-    if len(same_ref_in_col) > 1:
-        rows_sorted = sorted({_as_int(c.get("row")) for c in same_ref_in_col})
-        try:
-            idx = rows_sorted.index(row)
-        except ValueError:
-            idx = -1
-        segs = _get_segments(node)
-        if 0 <= idx < len(segs):
-            return segs[idx]
-        return str(node.get("text") or "")
-    return str(node.get("text") or "")
-
-
-def _as_int(v: Any, default: int = -1) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
+from typing import Callable, Optional
 
 
 # ---------------------------------------------------------------------------

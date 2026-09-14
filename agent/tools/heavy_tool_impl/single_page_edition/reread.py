@@ -77,7 +77,7 @@ def reread_page(
 ) -> dict[str, Any]:
     """PPTist slide JSON + page PNG → adapter → step1 → current_page_state.
 
-    Returns the new `understand_output_v1` dict and writes it into the shared
+    Returns the new `understand_output_v2` dict and writes it into the shared
     `page_understanding.json` wrapper for callers that still use this legacy
     reread entry point.
 
@@ -162,7 +162,7 @@ def reread_page(
         write_json(
             paths.page_understanding_json(page_num),
             {
-                "schema_version": "page_understanding_v2",
+                "schema_version": "page_understanding_v3",
                 "core": new_understand_output,
                 "common": {},
                 "focused": {"entries": []},

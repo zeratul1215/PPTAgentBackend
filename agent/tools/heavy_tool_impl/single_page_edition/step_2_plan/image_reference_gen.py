@@ -159,51 +159,26 @@ def _build_tables_prompt_block(
     one text node repeated down its rows)."""
     if not isinstance(tables, list) or not tables:
         return ""
-    id_kind = {
-        str(t.get("id") or ""): str(t.get("kind") or "")
-        for t in texts
-        if isinstance(t, dict)
-    }
     lines: list[str] = []
     for tbl in tables:
         if not isinstance(tbl, dict):
             continue
-        try:
-            rows = int(tbl.get("rows"))
-            cols = int(tbl.get("cols"))
-        except (TypeError, ValueError):
+        data = tbl.get("data")
+        if not isinstance(data, list) or not data:
             continue
-        cells = tbl.get("cells")
-        if rows <= 0 or cols <= 0 or not isinstance(cells, list):
-            continue
-        col_refs: dict[int, list[str]] = {}
-        for cell in cells:
-            if not isinstance(cell, dict):
-                continue
-            try:
-                c = int(cell.get("col"))
-            except (TypeError, ValueError):
-                continue
-            ref = str(cell.get("ref") or "")
-            if ref and ref not in col_refs.setdefault(c, []):
-                col_refs[c].append(ref)
-        col_desc: list[str] = []
-        for c in range(cols):
-            refs = col_refs.get(c, [])
-            if not refs:
-                col_desc.append(f"col {c}: (empty)")
-                continue
-            parts = [f"{r} ({id_kind.get(r, '')})".strip() for r in refs]
-            col_desc.append(f"col {c}: {', '.join(parts)}")
+        col_desc = []
+        for r, row in enumerate(data):
+            if not isinstance(row, list): continue
+            col_desc.append("row %d: %s" % (r, " | ".join(str(c.get("text") or "") for c in row if isinstance(c, dict))) )
         lines.append(
-            f'- table "{tbl.get("id") or ""}": {rows} rows x {cols} columns; '
+            f'- table "{tbl.get("id") or ""}": {len(data)} rows x {len(data[0]) if isinstance(data[0], list) else 0} columns; '
             + "; ".join(col_desc)
         )
     if not lines:
         return ""
     body = os.linesep.join(lines)
     return (
-        "Table structure (authoritative; ids refer to text blocks below): render each entry as ONE aligned table, rows by row index and columns left-to-right. Do not split a table into loose columns."
+        "Table structure (authoritative native matrix): render each entry as ONE aligned table, preserving row/column order and merged spans. Do not split a table into loose columns."
         + os.linesep
         + body
     )
@@ -241,7 +216,7 @@ def build_image_prompt(
     if deck_style:
         colors = deck_style.get("colors") if isinstance(deck_style.get("colors"), dict) else {}
         top3 = [c for c in colors.get("top3") or [] if isinstance(c, str) and c.strip()]
-        palette_hex = top3[:3] or _palette_hex(palette)
+        palette_hex = top3[:5] or _palette_hex(palette)
     else:
         palette_hex = _palette_hex(palette)
     palette_text = ", ".join(palette_hex) if palette_hex else "(none)"
@@ -318,7 +293,7 @@ def build_image_prompt(
 
 Whole-deck style (use after the user's explicit visual request):
 - Mood: {mood.get("name") or mood.get("id") or ""}{f" — {style_feel}" if style_feel else ""}
-- Main colors: {", ".join(str(c) for c in (colors.get("top3") or [])[:3])}
+- Main colors: {", ".join(str(c) for c in (colors.get("top3") or [])[:5])}
 - Layout feel: {overall_style}
 """.rstrip()
 
@@ -725,7 +700,7 @@ def generate_beautify_reference_image(
         colors = deck_style.get("colors") if isinstance(deck_style.get("colors"), dict) else {}
         top3 = [c for c in colors.get("top3") or [] if isinstance(c, str)]
         if top3:
-            palette = {"primary": top3[0], "fills": top3[1:]}
+            palette = {"primary": top3[0], "fills": top3[1:5]}
     texts = [t for t in (um.get("texts") or []) if isinstance(t, dict)]
     images = [im for im in (um.get("images") or []) if isinstance(im, dict)]
     tables = [tb for tb in (um.get("tables") or []) if isinstance(tb, dict)]

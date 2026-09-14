@@ -124,6 +124,16 @@ _EXTRACT_JS = r"""
   const verticalAlignFromStyle = (cs) => {
     const display = String(cs.display || '').toLowerCase();
     if (!display.includes('flex') && !display.includes('grid')) return 'top';
+
+    // Grid containers commonly center their rows with align-content. This is
+    // distinct from align-items, which aligns content inside each grid area.
+    // Reading only align-items loses the vertical position of a centered list.
+    if (display.includes('grid')) {
+      const contentValue = String(cs.alignContent || '').toLowerCase();
+      if (contentValue.includes('center')) return 'middle';
+      if (contentValue.includes('end')) return 'bottom';
+    }
+
     const direction = String(cs.flexDirection || 'row').toLowerCase();
     const axisValue = direction.startsWith('column') ? cs.justifyContent : cs.alignItems;
     const value = String(axisValue || '').toLowerCase();
@@ -153,6 +163,56 @@ _EXTRACT_JS = r"""
       }
     }
     return true;
+  };
+
+  // Some layouts put a decorative SVG next to a text node in the same
+  // container (for example a timeline dot followed by an event description).
+  // The container is not a text leaf because it contains an SVG, and walking
+  // element children alone would silently drop that direct text node. Measure
+  // each non-whitespace direct text node as its own editable text primitive.
+  const emitDirectTextNodes = (el, origin, out) => {
+    for (const node of el.childNodes) {
+      if (node.nodeType !== Node.TEXT_NODE) continue;
+      const raw = node.textContent || '';
+      const start = raw.search(/\S/);
+      if (start < 0) continue;
+      const endMatch = raw.match(/\S\s*$/);
+      const end = endMatch ? endMatch.index + endMatch[0].replace(/\s+$/, '').length : raw.length;
+      const text = raw.slice(start, end);
+      if (!text.trim()) continue;
+
+      const range = document.createRange();
+      range.setStart(node, start);
+      range.setEnd(node, end);
+      const r = range.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) continue;
+
+      const cs = getComputedStyle(el);
+      const color = rgbToHex(cs.color);
+      const fs = Math.round(pxNum(cs.fontSize) * 100) / 100;
+      const fontFamily = (cs.fontFamily || '').split(',')[0].trim().replace(/^['"]|['"]$/g, '');
+      let style = `color: ${color};font-size: ${fs}px;`;
+      if (fontFamily) style += `font-family: ${fontFamily};`;
+      let inner = escapeHtml(text);
+      if (cs.fontStyle === 'italic') inner = `<em>${inner}</em>`;
+      if (cs.textDecorationLine && cs.textDecorationLine.includes('underline')) inner = `<u>${inner}</u>`;
+      if (isBold(cs.fontWeight)) inner = `<strong>${inner}</strong>`;
+
+      const lh = pxNum(cs.lineHeight);
+      out.push({
+        kind: 'text',
+        box: { x: r.left - origin.left, y: r.top - origin.top, w: r.width, h: r.height },
+        content: `<span style="${style}">${inner}</span>`,
+        align: horizontalAlignFromStyle(cs),
+        vAlign: verticalAlignFromStyle(cs),
+        lineHeight: (lh && fs) ? +(lh / fs).toFixed(3) : 1.2,
+        defaultColor: color,
+        defaultFontName: fontFamily,
+        inset: [0, 0, 0, 0],
+        wordSpace: pxNum(cs.letterSpacing),
+        opacity: finiteNum(cs.opacity, 1),
+      });
+    }
   };
 
   const relBox = (el, origin) => {
@@ -412,8 +472,12 @@ _EXTRACT_JS = r"""
       pxNum(cs.paddingRight),
       pxNum(cs.paddingBottom),
       pxNum(cs.paddingLeft),
-    ].filter(v => Number.isFinite(v) && v > 0);
-    if (!vals.length) return 0;
+    ].filter(v => Number.isFinite(v));
+    if (vals.length !== 4) return 0;
+    // PPTist's inset is a uniform inner padding value.  Do not discard zero
+    // sides: `padding: 0 46px 0 0` is a right-aligned layout instruction, not
+    // a 46px inset.  Taking the minimum preserves the usable text width and
+    // leaves alignment to the paragraph's text-align value.
     return Math.min.apply(null, vals);
   };
 
@@ -544,6 +608,7 @@ _EXTRACT_JS = r"""
       const tr = document.createElement('tr');
       tr.style.height = cellMinHeight + 'px';
       rowCells.forEach(cell => {
+        if (cell.covered) return;
         const td = document.createElement('td');
         td.rowSpan = cell.rowspan || 1;
         td.colSpan = cell.colspan || 1;
@@ -586,7 +651,7 @@ _EXTRACT_JS = r"""
   const readTable = (table, origin) => {
     const box = relBox(table, origin);
     const rowsEl = Array.from(table.querySelectorAll('tr'));
-    const rows = [];
+    const physicalRows = [];
     const colWidths = [];
     rowsEl.forEach((tr, ri) => {
       const cells = [];
@@ -596,21 +661,64 @@ _EXTRACT_JS = r"""
         const cbox = td.getBoundingClientRect();
         if (ri === 0) colWidths.push(cbox.width || 1);
         cells.push({
+          cellId: td.getAttribute('data-cell-id') || '',
           text: td.innerText || td.textContent || '',
           colspan: parseInt(td.getAttribute('colspan') || '1', 10),
           rowspan: parseInt(td.getAttribute('rowspan') || '1', 10),
           bold: isBold(ccs.fontWeight),
           italic: ccs.fontStyle === 'italic',
           underline: (ccs.textDecorationLine || '').includes('underline'),
+          strikethrough: (ccs.textDecorationLine || '').includes('line-through'),
           color: rgbToHex(ccs.color),
           backcolor: isTransparent(ccs.backgroundColor) ? '' : rgbToHex(ccs.backgroundColor),
           fontsize: Math.round(pxNum(ccs.fontSize)),
           fontname: (ccs.fontFamily || '').split(',')[0].trim().replace(/^["']|["']$/g, ''),
           align: mapAlign(ccs.textAlign),
+          vAlign: ccs.verticalAlign === 'middle'
+            ? 'middle'
+            : (ccs.verticalAlign === 'bottom' ? 'bottom' : 'top'),
         });
       });
-      if (cells.length) rows.push(cells);
+      if (cells.length) physicalRows.push(cells);
     });
+    // Convert physical HTML cells into PPTist's full rectangular matrix. A
+    // rowspan/colspan cell occupies a rectangle; covered coordinates remain
+    // empty placeholders because PPTist expects them in data[][].
+    const rows = [], occupied = [], anchors = [];
+    physicalRows.forEach((cells, r) => {
+      if (!occupied[r]) occupied[r] = [];
+      let ci = 0;
+      cells.forEach(cell => {
+        while (occupied[r][ci]) ci++;
+        const rs = Math.max(1, cell.rowspan || 1), cs = Math.max(1, cell.colspan || 1);
+        anchors.push({r, c: ci, cell});
+        for (let rr = r; rr < r + rs; rr++) {
+          if (!occupied[rr]) occupied[rr] = [];
+          for (let cc = ci; cc < ci + cs; cc++) occupied[rr][cc] = true;
+        }
+        ci += cs;
+      });
+    });
+    const logicalRows = Math.max(physicalRows.length, occupied.length);
+    const logicalCols = Math.max(1, ...occupied.map(row => row ? row.length : 0));
+    for (let r = 0; r < logicalRows; r++) {
+      const out = Array.from({length: logicalCols}, (_, c) => ({text:'', colspan:1, rowspan:1, fontsize:14, covered:true}));
+      anchors.filter(a => a.r === r).forEach(a => { out[a.c] = a.cell; });
+      rows.push(out);
+    }
+    // Prefer the author-declared logical column widths. The first physical row
+    // is not sufficient when it contains colspan cells.
+    const declaredCols = Array.from(table.querySelectorAll(':scope > colgroup > col'));
+    if (declaredCols.length === logicalCols) {
+      const declared = declaredCols.map(col => {
+        const width = col.getBoundingClientRect().width || parseFloat(col.getAttribute('width') || '0');
+        return width > 0 ? width : 1;
+      });
+      colWidths.splice(0, colWidths.length, ...declared);
+    } else if (colWidths.length !== logicalCols) {
+      const equal = Math.max(1, box.w / logicalCols);
+      colWidths.splice(0, colWidths.length, ...Array.from({length: logicalCols}, () => equal));
+    }
     // Outline from a representative cell border.
     let borderColor = '#eeece1', borderWidth = 0;
     const firstCell = table.querySelector('td, th');
@@ -621,25 +729,28 @@ _EXTRACT_JS = r"""
     }
     const outline = { width: borderWidth, color: borderColor };
 
-    // Table-specific autoshrink: PPTist re-renders cells with padding:5px +
-    // line-height:1.5 + minHeight, so a table can grow taller than the source
-    // HTML box and spill off the page. Tables are top-left anchored and grow
-    // downward, so we keep top/left and colWidths fixed and shrink ONLY the
-    // font sizes by a single uniform factor k until the PPTist-rendered height
-    // fits the space below the table's top. Never enlarge (k<=1); floor the
-    // smallest cell font at 6px so text stays legible. Heights are measured with
-    // content-driven rows (no forced minimum), so cellMinHeight never pads rows.
+    // PPTist ignores a table element's stored height when rendering: its actual
+    // height comes from one shared `cellMinHeight` plus wrapped cell content.
+    // Preserve the existing overflow guard first: shrink fonts only when the
+    // native table would run past the page bottom. Then, when the HTML
+    // deliberately stretches a table (for example `height:100%` in a flex
+    // region), solve for the shared minimum row height that best preserves the
+    // occupied vertical area. This is the closest native PPTist can get because
+    // its schema has no per-row height array.
     let fontScale = 1;
     const normTotal = colWidths.reduce((a, b) => a + b, 0) || 1;
     const normWidths = colWidths.map(w => w / normTotal);
     const elementWidth = box.w;
     const BOTTOM_MARGIN = 5;
     const avail = origin.height - box.y - BOTTOM_MARGIN;
+    const targetHeight = Math.max(1, avail > 0 ? Math.min(box.h, avail) : box.h);
     let renderHeight = measurePptistTableHeight(rows, normWidths, elementWidth, outline, 1);
     if (avail > 0 && rows.length && renderHeight > avail) {
       const minFsRaw = Math.min.apply(null, rows.flatMap(r => r.map(c => c.fontsize || 14)));
       const minK = minFsRaw > 0 ? Math.min(1, 6 / minFsRaw) : 1;
-      // Binary search the largest k in [minK, 1] whose rendered height <= avail.
+      // Binary search the largest k in [minK, 1] whose rendered height fits the
+      // available page space. Do not shrink merely to match a compact HTML box:
+      // browser and PPTist font metrics differ, and that would reduce legibility.
       let lo = minK, hi = 1, best = minK;
       for (let i = 0; i < 14; i++) {
         const mid = (lo + hi) / 2;
@@ -649,18 +760,46 @@ _EXTRACT_JS = r"""
       fontScale = +best.toFixed(4);
     }
 
-    // Emit cellMinHeight = the SHORTEST content-driven row at the final font
-    // scale. Any smaller and the schema still needs a positive number; any
-    // larger would force the shortest rows taller and reintroduce the bottom
-    // padding gap. This lets PPTist size every row to its own content.
-    const finalMetrics = measurePptistTable(rows, normWidths, elementWidth, 1, outline, fontScale);
-    renderHeight = finalMetrics.total;
-    const cellMinHeight = finalMetrics.rowHeights.length
-      ? Math.max(1, Math.floor(Math.min.apply(null, finalMetrics.rowHeights)))
+    const naturalMetrics = measurePptistTable(rows, normWidths, elementWidth, 1, outline, fontScale);
+    renderHeight = naturalMetrics.total;
+    let cellMinHeight = naturalMetrics.rowHeights.length
+      ? Math.max(1, Math.floor(Math.min.apply(null, naturalMetrics.rowHeights)))
       : 1;
+
+    // A larger shared minimum is only needed when the HTML table intentionally
+    // occupies more height than its text naturally requires. The simulator is
+    // monotonic in cellMinHeight, so a small binary search gives the closest
+    // non-overflowing native-table height without page-specific heuristics.
+    if (rows.length && renderHeight + 1 < targetHeight) {
+      let lo = 1, hi = targetHeight, best = cellMinHeight;
+      let bestMetrics = naturalMetrics;
+      for (let i = 0; i < 14; i++) {
+        const mid = (lo + hi) / 2;
+        const metrics = measurePptistTable(
+          rows, normWidths, elementWidth, mid, outline, fontScale
+        );
+        if (metrics.total <= targetHeight) {
+          best = mid;
+          bestMetrics = metrics;
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      cellMinHeight = +best.toFixed(3);
+      renderHeight = bestMetrics.total;
+    }
 
     return {
       kind: 'table', box, rows, colWidths,
+      tableRef: table.getAttribute('data-ref') || '',
+      theme: {
+        color: table.getAttribute('data-theme-color') || '#67508F',
+        rowHeader: table.getAttribute('data-theme-row-header') === '1',
+        rowFooter: table.getAttribute('data-theme-row-footer') === '1',
+        colHeader: table.getAttribute('data-theme-col-header') === '1',
+        colFooter: table.getAttribute('data-theme-col-footer') === '1',
+      },
       cellMinHeight,
       fontScale,
       renderHeight,
@@ -779,6 +918,10 @@ _EXTRACT_JS = r"""
         && el.textContent && el.textContent.trim()) {
       const bgSvg = findCoverBgSvg(el, elBox);
       if (bgSvg && el.querySelectorAll('svg').length === 1) {
+        // Keep the outer element as the background/text box geometry, but read
+        // alignment from a nested layout container such as a centered grid.
+        // A nested text leaf has no useful container-level alignment of its own.
+        const layoutStyle = isTextLeaf(contentRef) ? cs : getComputedStyle(contentRef);
         out.push(readSvg(bgSvg, origin));
         const inset = textPaddingScalar(el, bgSvg);
         const lh = pxNum(cs.lineHeight);
@@ -788,7 +931,7 @@ _EXTRACT_JS = r"""
           content: serializeRuns(el),
           richContent: serializeParagraphs(el, bgSvg, horizontalAlignFromStyle(cs)),
           align: horizontalAlignFromStyle(cs),
-          vAlign: verticalAlignFromStyle(cs),
+          vAlign: verticalAlignFromStyle(layoutStyle),
           lineHeight: (lh && fs) ? +(lh / fs).toFixed(3) : 1.2,
           defaultColor: rgbToHex(cs.color),
           defaultFontName: (cs.fontFamily || '').split(',')[0].trim().replace(/^["']|["']$/g, ''),
@@ -820,6 +963,8 @@ _EXTRACT_JS = r"""
       }
       return;
     }
+
+    emitDirectTextNodes(el, origin, out);
 
     for (const c of el.children) walk(c, origin, out);
   };

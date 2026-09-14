@@ -6,7 +6,6 @@ import json
 import shutil
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +15,10 @@ from typing_extensions import TypedDict
 
 from agent_backend.agent.models import agent_model_name
 from agent_backend.agent.tools.context import (
+    assert_unique_page_jobs,
     emit,
-    project_lock,
+    execute_page_jobs,
+    page_job,
     require_agent_run_id,
     require_project_id,
     require_session_id,
@@ -35,19 +36,12 @@ from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.steps import 
 from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.step_2_plan.skills.base import (
     _call_claude_json,
 )
+from agent_backend.agent.tools.table_spec import table_from_composer
 from agent_backend.workspace import pageorder
 from agent_backend.workspace.assets import page_asset_source_dir
 from agent_backend.workspace.dirty import mark_pending_reread
 from agent_backend.workspace.paths import next_turn_dir, read_json, write_json, write_text
 from agent_backend.workspace.repo import record_turn
-
-
-try:
-    import os
-
-    MAX_PARALLEL_FILL_PAGES = max(1, int(os.environ.get("PPT_MAX_PARALLEL_PAGES", "3")))
-except ValueError:
-    MAX_PARALLEL_FILL_PAGES = 3
 
 
 class PageFill(TypedDict):
@@ -62,7 +56,7 @@ Return JSON only. Do not include markdown fences.
 
 Output schema:
 {
-  "schema_version": "page_spec_composer_v1",
+  "schema_version": "page_spec_composer_v2",
   "texts": [
     {
       "kind": "title | subheading | body | bullet_item | caption | label | date",
@@ -226,7 +220,7 @@ def _compose_page_spec(
     if obj is None:
         repair_prompt = {
             "instruction": "Repair the previous response into valid Page Spec Composer JSON. Preserve all semantic content; return JSON only.",
-            "schema": "page_spec_composer_v1",
+            "schema": "page_spec_composer_v2",
             "previous_error": err or "invalid_json",
             "previous_response": raw or "",
         }
@@ -250,8 +244,8 @@ def _compose_page_spec(
 
 
 def _validate_composer_output(obj: dict[str, Any], assets: list[dict[str, Any]]) -> dict[str, Any]:
-    if obj.get("schema_version") != "page_spec_composer_v1":
-        raise ValueError("composer schema_version must be page_spec_composer_v1")
+    if obj.get("schema_version") != "page_spec_composer_v2":
+        raise ValueError("composer schema_version must be page_spec_composer_v2")
 
     allowed_kinds = {"title", "subheading", "body", "bullet_item", "caption", "label", "date"}
     texts: list[dict[str, Any]] = []
@@ -323,7 +317,7 @@ def _validate_composer_output(obj: dict[str, Any], assets: list[dict[str, Any]])
     vi = obj.get("visual_intent") if isinstance(obj.get("visual_intent"), dict) else {}
     visual = {"requirements_text": str(vi.get("requirements_text") or "").strip()}
     return {
-        "schema_version": "page_spec_composer_v1",
+        "schema_version": "page_spec_composer_v2",
         "texts": texts,
         "images": images,
         "tables": tables,
@@ -334,7 +328,7 @@ def _validate_composer_output(obj: dict[str, Any], assets: list[dict[str, Any]])
 def _deck_palette(deck_style: dict[str, Any]) -> dict[str, Any]:
     colors = deck_style.get("colors") if isinstance(deck_style.get("colors"), dict) else {}
     top3 = [str(c).strip() for c in (colors.get("top3") or []) if str(c).strip()]
-    return {"primary": top3[0] if top3 else "", "fills": top3[1:3]}
+    return {"primary": top3[0] if top3 else "", "fills": top3[1:5]}
 
 
 def _soft_image_size(asset: dict[str, Any]) -> tuple[float, float]:
@@ -370,26 +364,12 @@ def _compile_create_page_spec(
 
     tables: list[dict[str, Any]] = []
     for table_idx, tbl in enumerate(composer.get("tables") or []):
-        rows = tbl.get("rows") if isinstance(tbl, dict) else None
-        if not isinstance(rows, list) or not rows:
+        if not isinstance(tbl, dict):
             continue
-        cells: list[dict[str, Any]] = []
-        row_count = len(rows)
-        col_count = len(rows[0]) if isinstance(rows[0], list) else 0
-        for r, row in enumerate(rows):
-            if not isinstance(row, list):
-                continue
-            for c, value in enumerate(row):
-                tid = f"tbl{table_idx}_r{r}_c{c}"
-                texts.append(
-                    {
-                        "id": tid,
-                        "kind": "label" if r < int(tbl.get("header_rows") or 0) else "body",
-                        "text": str(value or ""),
-                    }
-                )
-                cells.append({"row": r, "col": c, "ref": tid})
-        tables.append({"id": f"tbl{table_idx}", "rows": row_count, "cols": col_count, "cells": cells})
+        try:
+            tables.append(table_from_composer(tbl.get("rows"), f"tbl{table_idx}", int(tbl.get("header_rows") or 0)))
+        except ValueError:
+            continue
 
     by_asset_key = {str(a["asset_key"]): a for a in assets}
     images: list[dict[str, Any]] = []
@@ -418,7 +398,7 @@ def _compile_create_page_spec(
         visual_req = demand
 
     state = {
-        "schema_version": "understand_output_v1",
+        "schema_version": "understand_output_v2",
         "page_num": int(slot),
         "page_id": f"page{int(slot) - 1}",
         "page_size_pt": page_size_pt,
@@ -432,7 +412,7 @@ def _compile_create_page_spec(
         "warnings": [],
     }
     return {
-        "schema_version": "step2_output_v1",
+        "schema_version": "step2_output_v2",
         "user_request": demand,
         "selected_refs": [],
         "visual_intent": {
@@ -485,12 +465,10 @@ def _clean_consumed_run_uploads(paths, slot: int, run_id: str) -> None:
 def fill_empty_pages(fills: list[PageFill], runtime: ToolRuntime) -> dict[str, Any]:
     """Fill already-inserted blank pages with complete editable slide content.
 
-    Use this after `add_page` when a blank page should become a full content
-    slide. Each item is `{"page_ref": "page@<id>", "demand": "<complete natural
-    language page brief>"}`. The demand must include exact required copy,
-    content the system may generate, the page goal, layout/visual requirements,
-    and the role of every staged image. This tool only accepts blank pages whose
-    PPTist `elements` list is empty; use `edit_pages` for nonblank pages.
+    Each item supplies a stable reference to an existing blank page and a complete
+    natural-language page brief. The brief carries exact required copy, permitted
+    content generation, the page goal, visual requirements, and staged-image roles.
+    The tool accepts only pages whose PPTist `elements` list is empty.
     """
     pid = require_project_id(runtime)
     try:
@@ -521,7 +499,7 @@ def fill_empty_pages(fills: list[PageFill], runtime: ToolRuntime) -> dict[str, A
         return {"project_id": pid, "ok": False, "error": "no valid fills"}
 
     deck_style_row = require_ready_style(pid, interrupt_when_unready=True)
-    emit(pid, {"type": "batch_started", "project_id": pid, "count": len(parsed)})
+    emit(pid, {"type": "batch_started", "project_id": pid, "count": len(parsed), "agent_run_id": run_id})
 
     def _progress(item: dict[str, Any], index: int, stage: str, label: str) -> None:
         emit(
@@ -533,6 +511,7 @@ def fill_empty_pages(fills: list[PageFill], runtime: ToolRuntime) -> dict[str, A
                 "index": int(index),
                 "stage": stage,
                 "label": label,
+                "agent_run_id": run_id,
             },
         )
 
@@ -557,7 +536,7 @@ def fill_empty_pages(fills: list[PageFill], runtime: ToolRuntime) -> dict[str, A
             "status": "running",
         }
         write_json(turn_dir / "manifest.json", manifest)
-        emit(pid, {"type": "task_started", "page": page, "slot": slot, "demand": demand, "index": index})
+        emit(pid, {"type": "task_started", "page": page, "slot": slot, "demand": demand, "index": index, "agent_run_id": run_id})
         try:
             page_size_pt = _project_page_size(paths)
             deck_style = style_row.get("style_json") if isinstance(style_row.get("style_json"), dict) else {}
@@ -689,7 +668,7 @@ def fill_empty_pages(fills: list[PageFill], runtime: ToolRuntime) -> dict[str, A
                 error=None,
                 turn_dir=str(turn_dir),
             )
-            emit(pid, {"type": "task_finished", "page": page, "slot": slot, "demand": demand, "index": index, "turn_dir": str(turn_dir), "errors": [], "prepare_reread_png": False})
+            emit(pid, {"type": "task_finished", "page": page, "slot": slot, "demand": demand, "index": index, "turn_dir": str(turn_dir), "errors": [], "prepare_reread_png": False, "agent_run_id": run_id})
             return {"page": page, "ok": True, "status": "filled", "turn_dir": str(turn_dir)}
         except Exception as exc:  # noqa: BLE001
             err = f"{type(exc).__name__}: {exc}"
@@ -697,27 +676,31 @@ def fill_empty_pages(fills: list[PageFill], runtime: ToolRuntime) -> dict[str, A
             manifest.update({"status": "failed", "finished_at": time.time(), "duration_seconds": time.time() - started_at, "error": err})
             write_json(turn_dir / "manifest.json", manifest)
             record_turn(project_id=pid, session_id=sid, page_num=slot, demand=demand, ok=False, error=err, turn_dir=str(turn_dir))
-            emit(pid, {"type": "task_failed", "page": page, "slot": slot, "demand": demand, "index": index, "turn_dir": str(turn_dir), "error": err})
+            emit(pid, {"type": "task_failed", "page": page, "slot": slot, "demand": demand, "index": index, "turn_dir": str(turn_dir), "error": err, "agent_run_id": run_id})
             return {"page": page, "ok": False, "status": "fill_failed", "turn_dir": str(turn_dir)}
 
-    results_by_index: dict[int, dict[str, Any]] = {}
-    with project_lock(pid):
-        latest = public_style_row(pid)
-        if latest.get("status") != "ready" or not isinstance(latest.get("style_json"), dict):
-            raise RuntimeError("deck style became unavailable before filling blank pages")
-        deck_style_row = latest
-        max_workers = min(MAX_PARALLEL_FILL_PAGES, len(parsed))
-        if max_workers <= 1:
-            for idx, item in enumerate(parsed):
-                results_by_index[idx] = _run_one(idx, item, deck_style_row)
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="fill") as pool:
-                futures = {pool.submit(_run_one, idx, item, deck_style_row): idx for idx, item in enumerate(parsed)}
-                for fut in as_completed(futures):
-                    idx = futures[fut]
-                    results_by_index[idx] = fut.result()
+    assert_unique_page_jobs([int(item["slot"]) for item in parsed])
+    latest = public_style_row(pid)
+    if latest.get("status") != "ready" or not isinstance(latest.get("style_json"), dict):
+        raise RuntimeError("deck style became unavailable before filling blank pages")
+    deck_style_row = latest
 
-    emit(pid, {"type": "batch_finished", "project_id": pid})
+    def _run_one_coordinated(index: int) -> dict[str, Any]:
+        item = parsed[index]
+        with page_job(pid, int(item["slot"])):
+            current_page = pageorder.position_for_slot(paths, int(item["slot"]))
+            if current_page is None:
+                return {"page": item["page"], "slot": item["slot"], "ok": False, "status": "page_not_found"}
+            item = {**item, "page": int(current_page)}
+            return _run_one(index, item, deck_style_row)
+
+    results_by_index = execute_page_jobs(
+        pid,
+        [(idx, int(item["slot"])) for idx, item in enumerate(parsed)],
+        _run_one_coordinated,
+    )
+
+    emit(pid, {"type": "batch_finished", "project_id": pid, "agent_run_id": run_id})
     results = [results_by_index[i] for i in range(len(parsed))]
     return {"project_id": pid, "ok": all(r.get("ok") for r in results), "results": results}
 

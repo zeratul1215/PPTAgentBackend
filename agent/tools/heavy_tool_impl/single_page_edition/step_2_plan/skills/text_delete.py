@@ -29,6 +29,7 @@ from .base import (
     _flatten_to_segment_items,
     _get_segments,
     _set_segments,
+    _text_targets,
 )
 
 
@@ -81,31 +82,30 @@ def _run_delete(
     objective = str(intent.get("objective") or "").strip()
     if not objective:
         warnings.append(f"delete_empty_objective[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
-    texts: list[dict[str, Any]] = state.get("texts") or []
+    texts: list[dict[str, Any]] = _text_targets(state)
     by_id: dict[str, dict[str, Any]] = {str(t.get("id") or ""): t for t in texts if isinstance(t, dict)}
     all_ids = _all_text_ids(by_id)
     if not all_ids:
         warnings.append(f"delete_no_text_on_page[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     seg_items, seg_map, _seg_counts = _flatten_to_segment_items(
         ids=all_ids, by_id=by_id, selected=None
     )
     if not seg_items:
         warnings.append(f"delete_empty_segment_items[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     if dry_run:
         warnings.append(f"dry_run_stub_delete: {iid}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="already_satisfied", triggered_visual=False)
 
     payload = {
         "user_request": user_request,
         "objective": objective,
-        "items": [{"id": str(it.get("id") or ""), "kind": str(it.get("kind") or ""),
-                   "text": str(it.get("text") or "")} for it in seg_items],
+        "items": seg_items,
     }
     raw, obj, err = _call_claude_json(
         model=model,
@@ -117,10 +117,10 @@ def _run_delete(
     )
     if err:
         warnings.append(f"delete_call_error[{iid}]: {err}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
     if not isinstance(obj, dict) or not isinstance(obj.get("delete_ids"), list):
         warnings.append(f"delete_invalid_response[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     known_seg_ids = set(seg_map.keys())
     # Group selected segment indices per text node.
@@ -138,7 +138,7 @@ def _run_delete(
 
     if not seg_idxs_by_tid:
         warnings.append(f"delete_selected_nothing[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     removed_nodes = 0
     removed_segments = 0
@@ -155,40 +155,38 @@ def _run_delete(
         else:
             ids_to_drop.add(tid)
 
+    table_ids_to_clear: set[str] = set()
     if ids_to_drop:
+        for tid in ids_to_drop:
+            node = by_id.get(tid)
+            if isinstance(node, dict) and isinstance(node.get("_table_cell_ref"), dict):
+                node["_table_cell_ref"]["text"] = ""
+                table_ids_to_clear.add(tid)
+        original_texts = state.get("texts") if isinstance(state.get("texts"), list) else []
         state["texts"] = [
-            t for t in texts
+            t for t in original_texts
             if not (isinstance(t, dict) and str(t.get("id") or "") in ids_to_drop)
         ]
-        removed_nodes = len(ids_to_drop)
+        removed_nodes = len(ids_to_drop - table_ids_to_clear)
 
     if removed_nodes == 0 and removed_segments == 0:
         warnings.append(f"delete_selected_nothing[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     warnings.append(
         f"delete_applied[{iid}]: {removed_nodes} block(s), {removed_segments} line(s)"
     )
     # Removing elements changes the element set → re-flow to close the gap. The
     # compile layer prunes any dangling references left by dropped nodes.
-    return SkillResult(warnings=warnings, triggered_visual=True)
+    return SkillResult(warnings=warnings, status="applied", triggered_visual=True)
 
 
-_DELETE_PLAN_DOC = """  Delete EXISTING text from the page (a whole block, or specific lines/bullets).
-  Use for "删掉这段/去掉页脚那句/删掉最后一条要点/remove the disclaimer/drop the
-  subtitle". Do NOT use for masking sensitive spans (that's text.redact) or for
-  shortening/rephrasing text (that's text.rewrite) — delete REMOVES text.
-  `objective` (natural language) MUST name WHICH text to remove (by content/role/
-  position, e.g. "the footer line", "the last bullet in the right column", "the
-  paragraph mentioning pricing"). No `params` — the executor finds the target.
-  Removes elements, so it triggers a visual re-layout to close the gap."""
-
-
-_DELETE_ORDERING_NOTE = (
-    "Independent of most edits; when combined with rewrite/translate it usually "
-    "runs BEFORE them so effort isn't spent rewriting/translating text that is "
-    "about to be removed. Preference, not a rule — honor the user's stated order."
-)
+_DELETE_PLAN_DOC = """  Capability: remove existing text blocks or selected
+  lines/items. The natural-language objective must identify the target by visible
+  content, semantic role, or position. It removes text rather than masking or
+  rewriting it. Ordinary and Shape-contained text blocks may be removed; deleting
+  all text from a table cell clears that cell but preserves the table and grid.
+  Removing content may require visual re-layout."""
 
 
 SKILL = Skill(
@@ -198,5 +196,5 @@ SKILL = Skill(
     plan_doc=_DELETE_PLAN_DOC,
     repair=_repair_delete_params,
     execute=_run_delete,
-    ordering_note=_DELETE_ORDERING_NOTE,
+    ordering_note="Usually precedes transformations of the same scope so content scheduled for removal is not processed unnecessarily.",
 )

@@ -438,6 +438,8 @@ def _table_cell(cell: dict, font_scale: float = 1.0) -> dict:
         style["em"] = True
     if cell.get("underline"):
         style["underline"] = True
+    if cell.get("strikethrough"):
+        style["strikethrough"] = True
     if cell.get("color"):
         style["color"] = cell["color"]
     if cell.get("backcolor"):
@@ -450,8 +452,10 @@ def _table_cell(cell: dict, font_scale: float = 1.0) -> dict:
         style["fontname"] = fontname
     if cell.get("align") and cell["align"] != "left":
         style["align"] = cell["align"]
+    if cell.get("vAlign") and cell["vAlign"] != "top":
+        style["vAlign"] = cell["vAlign"]
     out = {
-        "id": _gen_id(),
+        "id": cell.get("cellId") or _gen_id(),
         "colspan": cell.get("colspan", 1),
         "rowspan": cell.get("rowspan", 1),
         "text": cell.get("text", ""),
@@ -472,7 +476,7 @@ def _table_element(prim: dict) -> dict:
     ow = outline.get("width", 0) or 0
     el = {
         "type": "table",
-        "id": _gen_id(),
+        "id": prim.get("tableRef") or _gen_id(),
         "left": round(b["x"], 3),
         "top": round(b["y"], 3),
         "width": round(b["w"], 3),
@@ -483,10 +487,12 @@ def _table_element(prim: dict) -> dict:
         "data": data,
         "outline": {
             "width": round(ow, 2) if ow else 1,
-            "style": "solid",
+            "style": outline.get("style", "solid"),
             "color": outline.get("color", "#eeece1"),
         },
     }
+    if prim.get("theme"):
+        el["theme"] = prim["theme"]
     return el
 
 

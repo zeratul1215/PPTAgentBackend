@@ -38,6 +38,7 @@ from .skills.base import (
     _call_claude_json,
     _get_segments,
 )
+from ....table_spec import slim_table_for_model
 
 
 DEFAULT_MODEL = "claude-opus-4-8"
@@ -63,7 +64,8 @@ _PLAN_SYSTEM_PROMPT_BASE = """You are the "PLAN" stage of a single-page PPT-edit
 
 You will receive:
 1) `user_request`: a natural-language instruction from the user about how to modify ONE page.
-2) `understand_output`: structured page representation produced by Step 1 (texts[], images[], original_layout_description_en, ...).
+2) `understand_output`: structured page representation produced by the page-understanding service (texts[], images[], native tables[], original_layout_description_en, ...).
+3) `previous_html_available`: whether a successful final HTML rendering still matches the current PPTist page.
 {SELECTION_INPUT_DOC}
 
 Your job is LIGHTWEIGHT ROUTING, not execution. Read the user's ENTIRE request
@@ -78,8 +80,17 @@ Emit a strictly typed JSON object with TWO independent parts:
 
   A) `content_intents`: an ordered list of CONTENT edits (change the actual text /
      content of the page). Each entry invokes ONE "skill".
-  B) `visual_intent`: a SINGLE object describing whether the page should be
+B) `visual_intent`: a SINGLE object describing whether the page should be
      visually re-laid-out / restyled, and the user's visual requirements verbatim.
+
+  C) `reassembly_strategy`: decide whether a valid previous final HTML can be
+     used as a layout/style reference for this complete HTML generation.
+     Use {"mode":"reuse_previous_html|rebuild", "change_scope":"local|section|global",
+     "reason":"short internal reason"}. Choose reuse only when the main page
+     structure, grouping, reading order, and regions remain suitable. Choose
+     rebuild when the page needs a new composition, new major regions, changed
+     columns, changed component types, or a different reading order. This is a
+     generation strategy, never an HTML diff or DOM patch.
 
 You MUST follow these rules:
 
@@ -103,9 +114,8 @@ You MUST follow these rules:
   written so the skill's own executor can act on it WITHOUT seeing the rest of
   your plan. HARD RULES for `objective`:
     * NEVER reference text ids / refs (no "t3", "t5"), and NEVER reference cell
-      coordinates. Describe WHICH text by its content, role, or position instead
-      — e.g. "the main title at the top", "the body paragraphs", "the footer
-      line", "the bullet items on the right", "the rows mentioning 2016".
+      coordinates. Describe the target by its visible content, semantic role, or
+      position.
     * Be SELF-CONTAINED: state every part of the work this skill must do, because
       the executor sees only this one `objective` (plus the user's original
       wording for context) and the full page — not your other intents or your
@@ -114,27 +124,14 @@ You MUST follow these rules:
       rule below).
 
 - ONE INTENT PER SKILL (max). Do NOT emit two intents with the same `skill`.
-  If the user wants a skill applied in several places, describe ALL of them in
-  that skill's single `objective`. Example: "把标题双语化,并把表格第五行也双语化"
-  → ONE `text.translate` intent whose objective is "Make bilingual (keep the
-  source and add an English translation of): (1) the page's main title; and
-  (2) the content that will go into row 5 of the table (the ... row)."
-  Reason: each executor picks its own target text from the whole page; two
-  same-skill intents would independently re-scan and could overlap or miss
-  parts.
+  If one skill must affect several targets, describe all of them in that skill's
+  single objective. Each executor scans the whole page once.
 
-- `visual_detail_provided` (bool): set `true` ONLY when the user gave a SPECIFIC
-  visual / placement requirement that governs HOW THIS intent's result is laid
-  out — e.g. where the produced text sits, how it is arranged relative to other
-  content, its side / columns / order / relative size. Otherwise set `false`.
+- `visual_detail_provided` (bool): set `true` ONLY when the user gave a specific
+  visual or placement requirement governing how this intent's result is laid
+  out. Otherwise set `false`.
   This tells downstream code whether to inject a built-in default layout for this
   intent (only when `false`).
-    * `true`  — "把这页双语化,英文放左中文放右" (position governs the translation)
-                / "翻译成英文并让译文居中" (placement of this intent's output).
-    * `false` — "把这页双语化" / "翻译一下" (pure content, no placement said)
-                / "双语化,顺便美化一下" (a BARE beautify is NOT a specific layout
-                  requirement for this intent) / a visual requirement that is
-                  only about OTHER content, not this intent's output.
   When unsure, prefer `false` (let the default layout apply). Any specific visual
   wording you DO see must still be copied VERBATIM into `visual_intent.
   requirements_text` as today — this boolean is in addition to, not instead of,
@@ -147,30 +144,14 @@ You MUST follow these rules:
     * THE USER'S STATED ORDER WINS. If the request implies or states a sequence
       ("先…再…", "translate after you rewrite", "首先脱敏"), encode exactly that
       via `after`.
-    * When the user does NOT specify an order, consult each skill's "ordering
-      suggestion" in AVAILABLE SKILLS below. These are per-skill hints about what
-      usually runs before/after and WHY. Weigh them and set `after` accordingly.
-      They are SUGGESTIONS, not fixed law — there is no single global order that
-      fits every request, so reason about THIS request rather than applying a
-      rote sequence.
+    * When the user does NOT specify an order, infer the data dependencies required
+      by the requested final state and the chosen skills. Use each skill's usual
+      ordering note as soft guidance, not as a mandatory workflow.
     * For genuinely unrelated intents, leave `after` empty. Do NOT add fake
       dependencies.
-    * Note: a few ordering constraints are enforced downstream for
-      safety/correctness even if you omit them (e.g. redaction before any skill
-      that re-emits text). You still SHOULD encode the order you intend; the
-      enforcement is only a backstop.
-    * PHASE RULE (enforced in code): every TABLE skill (`table.build`,
-      `table.reshape`, `table.compute`) runs AFTER every TEXT skill
-      (`text.redact`, `text.rewrite`, `text.translate`, `text.add`,
-      `text.delete`) — table skills always operate on the FINAL text. So you do
-      NOT need `after` edges from a table
-      intent to a text intent, and you MUST NEVER make a TEXT intent depend on a
-      TABLE intent. If the user says "put X in a table, then translate that
-      column", express it as the equivalent order: translate that content first
-      (a text.translate intent whose objective names that content), then build
-      the table (a table.build intent whose objective says to include both the
-      source and its translation as columns).
-
+    * Note: a few safety/correctness ordering constraints are enforced downstream
+      even if omitted. You still SHOULD encode the order required by this request;
+      code enforcement is only a backstop.
 --- AVAILABLE SKILLS ---
 {SKILL_DOCS}
 
@@ -178,17 +159,10 @@ You MUST follow these rules:
 
 - `visual_intent` is a single object: {"enabled": <bool>, "requirements_text": "<string>"}.
 
-- Set `visual_intent.enabled = true` when the user asked for ANYTHING about how the
-  page LOOKS -- layout, arrangement, style, color/atmosphere, emphasis, or a bare
-  "美化 / beautify / make it look better". This is NOT a skill: downstream a fixed
-  reference-image pipeline redesigns the page and step3 rebuilds it. A "visual
-  request" includes (non-exhaustive):
-    * position / side: "英文放左边中文放右边", "把标题放到顶部", "logo 移到右下角"
-    * columns / grouping: "分成两栏", "并排显示", "做成三列", "side by side"
-    * alignment / order: "居中对齐", "从上到下依次排列", "reorder as ..."
-    * spacing / emphasis / resizing: "把要点放大", "拉开间距", "突出这块"
-    * style / color / mood: "换成蓝色调", "更商务", "扁平风", "背景改深色"
-    * a bare beautify: "美化一下", "排版好看点", "make this slide nicer"
+- Set `visual_intent.enabled = true` when the requested final state includes a
+  visual change to layout, composition, placement, alignment, spacing, emphasis,
+  size, color, or overall styling. This is not a skill; it is the visual target
+  for downstream page reconstruction.
 
 - `requirements_text`: copy the user's visual requirement VERBATIM (the exact words
   describing what they want visually). Do NOT distill, translate, or summarize it --
@@ -198,59 +172,10 @@ You MUST follow these rules:
 - When `visual_intent.enabled = false`, the page keeps its current layout and only
   the content edits from Part A are applied.
 
-- CRITICAL — do NOT over-trigger the visual intent. Set `enabled = true` ONLY when
-  the user EXPLICITLY asked for a visual/layout/style change. A pure content edit
-  (translate / rewrite / redact, INCLUDING a plain bilingual "双语化 / 中英双语 /
-  add an English translation" with NO position/style words) MUST keep
-  `enabled = false`. Producing source+translation fragments does NOT by itself need
-  a visual re-layout: the renderer already places each translation adjacent to its
-  source, and a content skill will itself request a re-flow at runtime if it changed
-  the text volume enough. When unsure whether a phrase is a real visual requirement,
-  prefer `enabled = false` and note it in `skip_reasons`
-  (e.g. "no_visual: request is content-only, no explicit layout/style requirement").
-
-Examples (content + visual together):
-  * "rewrite to be more commercial AND translate to English"
-      → content_intents:
-          i0 text.rewrite   {objective: "Rewrite all the page text in a more
-                              commercial/marketing tone, keeping the meaning.",
-                              after: []}
-          i1 text.translate {objective: "Translate all the page text into
-                              English, REPLACING the source (not bilingual).",
-                              after: ["i0"], visual_detail_provided: false}
-        visual_intent: {enabled:false, requirements_text:""}
-  * "把这一页做成中英双语" / "add an English translation"
-      → content_intents:
-          i0 text.translate {objective: "Make the whole page bilingual: keep the
-                              original Chinese and add an English translation of
-                              every text item.", after: [],
-                              visual_detail_provided: false}
-        visual_intent: {enabled:false, requirements_text:""}
-      Note: pure content edit, no placement word -> visual stays disabled and
-      visual_detail_provided is false (a built-in default bilingual layout will
-      be applied downstream). The "bilingual vs replace" decision lives in the
-      objective's wording — say "keep ... and add a translation" for bilingual,
-      or "translate, replacing the source" for a pure replacement.
-  * "美化一下这一页" / "just make it look nicer"
-      → content_intents: [];
-        visual_intent: {enabled:true, requirements_text:"美化一下这一页"}
-  * "Make the body text bilingual, with English on the left and Chinese on the
-     right, and redact the organization names."
-      → content_intents:
-          i0 text.redact    {objective: "Redact/mask all organization (company /
-                              institution) names throughout the page text.",
-                              after: [], visual_detail_provided: false}
-          i1 text.translate {objective: "Make the BODY text bilingual: keep the
-                              Chinese body paragraphs and add an English
-                              translation of each.", after: ["i0"],
-                              visual_detail_provided: true}
-        visual_intent: {enabled:true, requirements_text:"English on the left and Chinese on the right"}
-      Note: "English left, Chinese right" is a POSITION requirement for the
-      translation, so the visual intent is enabled AND the translate intent's
-      visual_detail_provided is true (the user's placement wins; no default is
-      injected). Redact carries no placement requirement of its own, so its
-      visual_detail_provided is false. Redact is listed before translate so
-      masked spans are never carried into the translation.
+- Do not infer a visual request merely from the name of a content operation.
+  Decide from the requested final appearance. Runtime content changes may still
+  trigger necessary reflow without changing this field. When uncertain, prefer
+  `enabled = false` and record the uncertainty in `skip_reasons`.
 
 - `skip_reasons` is a list of short English strings explaining anything you intentionally did not do.
 
@@ -265,10 +190,9 @@ _PLAN_SELECTION_INPUT_DOC_A = """3) `selected_refs`: a non-empty list of text id
 TARGETING WITH A SELECTION: you still do NOT put ids in `objective`. Instead,
 look up each selected id in `understand_output.texts[]`, read its text/role, and
 DESCRIBE that selected content in natural language inside the objective so the
-skill's executor can re-find it on the page — e.g. "the selected title 'Q3
-Results' and the selected paragraph that starts 'Our revenue…'". Treat the
+skill's executor can re-find it on the page. Treat the
 selection as the default target unless `user_request` clearly overrides it
-(e.g. "ignore my selection, translate the whole page" → target the whole page)."""
+with a different scope."""
 
 _PLAN_SELECTION_INPUT_DOC_B = "(No frontend selection is provided. Describe each objective's target purely from `user_request` and the page content.)"
 
@@ -286,6 +210,7 @@ def _build_plan_user_text(
     user_request: str,
     selected_refs: list[str],
     understand_output: dict[str, Any],
+    previous_html_available: bool = False,
 ) -> str:
     """Build the user-side payload for the planner.
 
@@ -335,6 +260,18 @@ def _build_plan_user_text(
         for im in (understand_output.get("images") or [])
         if isinstance(im, dict)
     ]
+
+    def _slim_table(table: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return {"id": str(table.get("id") or ""), **slim_table_for_model(table)}
+        except ValueError:
+            return {"id": str(table.get("id") or ""), "data": []}
+
+    slim_tables = [
+        _slim_table(table)
+        for table in (understand_output.get("tables") or [])
+        if isinstance(table, dict)
+    ]
     payload: dict[str, Any] = {
         "user_request": user_request,
         "understand_output": {
@@ -344,8 +281,10 @@ def _build_plan_user_text(
             "palette": understand_output.get("palette"),
             "texts": slim_texts,
             "images": slim_images,
+            "tables": slim_tables,
             "original_layout_description_en": understand_output.get("original_layout_description_en") or "",
         },
+        "previous_html_available": bool(previous_html_available),
     }
     if selected_refs:
         payload["selected_refs"] = list(selected_refs)
@@ -367,6 +306,39 @@ def _normalize_visual_intent(plan_out: dict[str, Any]) -> list[str]:
         # falls back to user_request), but flag it so we can spot planner gaps.
         notes.append("plan_visual_intent_enabled_without_requirements_text")
     plan_out["visual_intent"] = {"enabled": enabled, "requirements_text": req}
+    return notes
+
+
+def _normalize_reassembly_strategy(
+    plan_out: dict[str, Any], *, previous_html_available: bool
+) -> list[str]:
+    """Normalize the planner's generation strategy and apply the hard gate."""
+    notes: list[str] = []
+    allowed_modes = {"reuse_previous_html", "rebuild"}
+    allowed_scopes = {"local", "section", "global"}
+    raw = plan_out.get("reassembly_strategy")
+    strategy = raw if isinstance(raw, dict) else {}
+    mode = str(strategy.get("mode") or "").strip()
+    scope = str(strategy.get("change_scope") or "").strip()
+    reason = str(strategy.get("reason") or "").strip()
+    if mode not in allowed_modes:
+        mode = "rebuild"
+        notes.append("reassembly_strategy_defaulted")
+    if scope not in allowed_scopes:
+        scope = "global" if mode == "rebuild" else "section"
+        notes.append("reassembly_change_scope_defaulted")
+    if not previous_html_available and mode == "reuse_previous_html":
+        mode = "rebuild"
+        scope = "global"
+        reason = "no_previous_html_available"
+        notes.append("reassembly_reuse_blocked_no_previous_html")
+    if not reason:
+        reason = "planner_selected_rebuild" if mode == "rebuild" else "planner_selected_previous_html_reference"
+    plan_out["reassembly_strategy"] = {
+        "mode": mode,
+        "change_scope": scope,
+        "reason": reason[:300],
+    }
     return notes
 
 
@@ -462,8 +434,9 @@ def _enforce_hard_ordering(plan_out: dict[str, Any]) -> list[str]:
     """Enforce ONLY the few safety/correctness ordering edges declared locally by
     skills via `Skill.hard_before` (see `_hard_ordering_edges`).
 
-    Cross-skill sequencing is otherwise the planner's job (guided by each skill's
-    `ordering_note`); we no longer impose a global `canonical_rank` order. Here we
+    Cross-skill sequencing is otherwise inferred by the planner from the current
+    request and the declared capabilities. We do not impose a global
+    `canonical_rank` order. Here we
     only add the missing `after` edge for a hard (A -> B) pair when BOTH skills are
     present, AND only when it would not contradict an order the planner already set
     (i.e. skip if B is already required before A, to avoid creating a cycle — the
@@ -536,6 +509,11 @@ def _empty_plan(selected_refs: list[str], skip_reasons: list[str]) -> dict[str, 
         "selected_refs": list(selected_refs),
         "content_intents": [],
         "visual_intent": {"enabled": False, "requirements_text": ""},
+        "reassembly_strategy": {
+            "mode": "rebuild",
+            "change_scope": "global",
+            "reason": "no_previous_html_available",
+        },
         "skip_reasons": list(skip_reasons),
     }
 
@@ -548,6 +526,7 @@ def plan_step(
     api_key: str | None,
     model: str,
     dry_run: bool,
+    previous_html_available: bool = False,
 ) -> tuple[dict[str, Any], list[str], str]:
     """Step 2A: produce a PlanOutputV1 from a natural-language request."""
     warnings: list[str] = []
@@ -574,6 +553,7 @@ def plan_step(
         user_request=user_request,
         selected_refs=filtered_selected_refs,
         understand_output=understand_output,
+        previous_html_available=previous_html_available,
     )
     raw, obj, err = _call_claude_json(
         model=model,
@@ -594,38 +574,27 @@ def plan_step(
     obj.setdefault("content_intents", [])
     obj["selected_refs"] = list(filtered_selected_refs)
     obj["schema_version"] = "plan_output_v1"
+    warnings.extend(_normalize_reassembly_strategy(obj, previous_html_available=previous_html_available))
     warnings.extend(_normalize_visual_intent(obj))
     warnings.extend(_repair_plan_params(obj))
     warnings.extend(_enforce_hard_ordering(obj))
-    warnings.extend(_validate_plan_output(obj, understand_output))
+    contract_errors = _validate_plan_output(obj, understand_output)
+    warnings.extend(contract_errors)
+    if contract_errors:
+        obj["fatal_errors"] = [f"plan_contract_error: {error}" for error in contract_errors]
     return obj, warnings, raw
-
-
-# Coarse execution phases, in the order the compiler forces them to run
-# (Scheme A, changelog 2026-07-21_03): all "text" skills finish before any
-# "table" skill starts, so table skills always see the FINAL text nodes and
-# stable ids. Lower rank = runs earlier. Unknown phases sort last.
-# "image" runs last: image add/delete/replace only touch `state["images"]`,
-# never text/table nodes, so their relative order to text/table is irrelevant
-# for correctness; pinning them last keeps a stable, predictable sequence.
-_PHASE_RANK: dict[str, int] = {"text": 0, "table": 1, "image": 2}
 
 
 def _intent_phase_rank(intent: dict[str, Any]) -> int:
     skill = SKILLS.get(str(intent.get("skill") or ""))
-    phase = getattr(skill, "phase", "text") if skill is not None else "text"
-    return _PHASE_RANK.get(str(phase), len(_PHASE_RANK))
+    return int(getattr(skill, "canonical_rank", 9999)) if skill is not None else 9999
 
 
 def _topo_sort_intents(intents: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-    """Kahn's algorithm with a PHASE-aware ready-queue.
+    """Topologically order intents using only declared real dependencies.
 
-    Scheme A is enforced here: among intents that are simultaneously ready (all
-    their `after` deps satisfied), we always pop a "text"-phase intent before a
-    "table"-phase one. Because the planner is told never to make a text intent
-    depend on a table intent, this yields "all text edits, then all table edits"
-    without needing explicit `after` edges — while still honoring every real
-    dependency the planner did declare. Returns (ordered_intents, warnings).
+    Skill rank is only a deterministic tie-breaker for independent intents; it
+    never creates a dependency or prescribes a table workflow.
     """
     warnings: list[str] = []
     by_id: dict[str, dict[str, Any]] = {}
@@ -662,21 +631,6 @@ def _topo_sort_intents(intents: list[dict[str, Any]]) -> tuple[list[dict[str, An
         warnings.append(f"compile_cycle_or_unresolved_deps: {leftover}")
         out_order.extend(leftover)
 
-    # Backstop: if a planner-declared `after` forced a table intent ahead of a
-    # later text intent (violating Scheme A), surface it. The dependency is still
-    # honored above; this only flags the unusual ordering for review.
-    last_table_pos = -1
-    for pos, iid in enumerate(out_order):
-        rank = _intent_phase_rank(by_id[iid])
-        if rank >= _PHASE_RANK["table"]:
-            last_table_pos = pos
-        elif rank == _PHASE_RANK["text"] and last_table_pos >= 0:
-            warnings.append(
-                f"compile_phase_order_violation: text intent {iid!r} runs after a "
-                f"table intent (planner `after` forced it); expected text-before-table"
-            )
-            break
-
     return [by_id[i] for i in out_order if i in by_id], warnings
 
 
@@ -689,7 +643,8 @@ def _prune_dangling_text_refs(state: dict[str, Any]) -> list[str]:
 
     A skill that REMOVES a text node (e.g. `text.delete`) can leave OTHER nodes
     with a `translation_of` / `derived_from` / `merged_into` pointing at the gone
-    id, or a table cell `ref` pointing at it. Per the Path B decision (changelog
+    id. Native table cells do not point at text nodes and are never pruned here.
+    Per the Path B decision (changelog
     2026-08-04_01, clarification 2) we do NOT cascade-delete the referring content
     — that text is kept and simply demoted to a plain node by dropping the now-
     dangling link. Table cells whose sole ref vanished are dropped (and empty
@@ -728,28 +683,8 @@ def _prune_dangling_text_refs(state: dict[str, Any]) -> list[str]:
                     t.pop("derived_op", None)
                 notes.append(f"pruned_dangling_derived_from[{tid}]")
 
-    tables = state.get("tables")
-    if isinstance(tables, list):
-        surviving_tables: list[dict[str, Any]] = []
-        for tbl in tables:
-            if not isinstance(tbl, dict):
-                continue
-            cells = tbl.get("cells")
-            if not isinstance(cells, list):
-                surviving_tables.append(tbl)
-                continue
-            new_cells = [
-                c for c in cells
-                if isinstance(c, dict) and str(c.get("ref") or "") in live_ids
-            ]
-            if len(new_cells) != len(cells):
-                notes.append(f"pruned_dangling_table_cells: {len(cells) - len(new_cells)}")
-            if new_cells:
-                tbl["cells"] = new_cells
-                surviving_tables.append(tbl)
-            else:
-                notes.append("pruned_empty_table_after_delete")
-        state["tables"] = surviving_tables
+    # Native tables own their cell text and never reference state["texts"].
+    # Deliberately do not prune or rewrite them here.
 
     return notes
 
@@ -831,32 +766,7 @@ def _compact_state_text_ids(state: dict[str, Any]) -> tuple[bool, dict[str, str]
 
     state["texts"] = survivors
 
-    # Table cell refs point at text ids; remap/prune them so tables stay valid
-    # after renumbering. Drop cells whose ref was removed, and drop tables that
-    # end up empty.
-    tables = state.get("tables")
-    if isinstance(tables, list):
-        surviving_tables: list[dict[str, Any]] = []
-        for tbl in tables:
-            if not isinstance(tbl, dict):
-                continue
-            cells = tbl.get("cells")
-            if not isinstance(cells, list):
-                continue
-            new_cells: list[dict[str, Any]] = []
-            for cell in cells:
-                if not isinstance(cell, dict):
-                    continue
-                ref = str(cell.get("ref") or "")
-                if ref in dropped_ids:
-                    continue
-                if ref in id_map:
-                    cell = {**cell, "ref": id_map[ref]}
-                new_cells.append(cell)
-            if new_cells:
-                tbl["cells"] = new_cells
-                surviving_tables.append(tbl)
-        state["tables"] = surviving_tables
+    # Native table cells are independent of compacted text ids.
 
     return True, id_map
 
@@ -889,11 +799,11 @@ def compile_step(
     visual_requirements = str(plan_visual.get("requirements_text") or "")
 
     state = _clone_understand(understand_output)
-
     ordered, w = _topo_sort_intents([it for it in intents if isinstance(it, dict)])
     warnings.extend(w)
 
     executed_ids: list[str] = []
+    fatal_errors: list[str] = []
     skill_triggered_visual = False
     collected_visual_defaults: list[dict[str, str]] = []
     for intent in ordered:
@@ -901,6 +811,9 @@ def compile_step(
         skill = SKILLS.get(skill_id)
         if skill is None:
             warnings.append(f"compile_no_skill_for_id: {skill_id}")
+            fatal_errors.append(
+                f"intent {intent.get('id') or '?'} references unknown skill {skill_id or '?'}"
+            )
             continue
         try:
             _t0 = time.monotonic()
@@ -925,7 +838,16 @@ def compile_step(
             )
             if not isinstance(result, SkillResult):
                 warnings.append(f"compile_skill_bad_result[{intent.get('id')}]: {skill_id}")
-                result = SkillResult()
+                result = SkillResult(status="failed")
+            # Older skills used warnings as their only error channel.  Treat
+            # contract/target failures as fatal even if such a skill forgot to
+            # set the new explicit status field.
+            if result.status == "applied" and any(
+                token in str(w).lower()
+                for w in result.warnings
+                for token in ("error", "invalid", "no_target", "not_found", "selected_nothing", "forbidden", "bad_")
+            ):
+                result.status = "failed"
             if result.warnings:
                 warnings.extend(result.warnings)
             if result.triggered_visual:
@@ -943,6 +865,11 @@ def compile_step(
                 warnings.append(
                     f"compile_injected_visual_default[{intent.get('id')}]: {vd.key}"
                 )
+            if result.status not in {"applied", "already_satisfied"}:
+                warnings.append(f"compile_skill_failed[{intent.get('id')}]: {skill_id}")
+                warnings.extend(result.warnings or [f"skill outcome={result.status}"])
+                fatal_errors.append(f"intent {intent.get('id') or '?'} ({skill_id}) failed")
+                continue
             executed_ids.append(str(intent.get("id") or ""))
             prune_notes = _prune_dangling_text_refs(state)
             if prune_notes:
@@ -956,6 +883,9 @@ def compile_step(
                     warnings.append(f"compile_compacted_after[{intent.get('id')}]: dropped placeholders")
         except Exception as e:
             warnings.append(f"compile_skill_exception[{intent.get('id')}]: {type(e).__name__}: {e}")
+            fatal_errors.append(
+                f"intent {intent.get('id') or '?'} ({skill_id or '?'}) raised an exception"
+            )
 
     resolved_visual = {
         "enabled": bool(visual_enabled or skill_triggered_visual),
@@ -968,8 +898,9 @@ def compile_step(
     }
 
     out: dict[str, Any] = {
-        "schema_version": "compile_output_v1",
+        "schema_version": "compile_output_v2",
         "executed_intent_ids": executed_ids,
+        "fatal_errors": fatal_errors,
         "visual_intent": resolved_visual,
         "understand_modified": state,
     }
@@ -982,6 +913,7 @@ def step2_run(
     api_key: str | None,
     model: str,
     dry_run: bool,
+    previous_html_available: bool = False,
 ) -> dict[str, Any]:
     """End-to-end Step 2 (Plan + Compile) for ONE page."""
     _t_step2_start = time.monotonic()
@@ -1008,6 +940,7 @@ def step2_run(
         api_key=api_key,
         model=model,
         dry_run=dry_run,
+        previous_html_available=previous_html_available,
     )
     _t_plan = time.monotonic()
     plan_fatal_errors = [
@@ -1017,11 +950,16 @@ def step2_run(
     ]
     if plan_fatal_errors:
         return {
-            "schema_version": "step2_output_v1",
+            "schema_version": "step2_output_v2",
             "user_request": user_request,
             "selected_refs": selected_refs,
             "visual_intent": {"enabled": False, "requirements_text": "", "default_details": []},
             "plan": plan_out,
+            "reassembly_strategy": {
+                "mode": "rebuild",
+                "change_scope": "global",
+                "reason": "step2_plan_failed",
+            },
             "compile": {
                 "understand_modified": understand_output,
                 "visual_intent": {"enabled": False, "requirements_text": "", "default_details": []},
@@ -1062,16 +1000,22 @@ def step2_run(
         resolved_visual = {"enabled": False, "requirements_text": "", "default_details": []}
 
     return {
-        "schema_version": "step2_output_v1",
+        "schema_version": "step2_output_v2",
         "user_request": user_request,
         "selected_refs": selected_refs,
         "visual_intent": resolved_visual,
+        "reassembly_strategy": dict(plan_out.get("reassembly_strategy") or {
+            "mode": "rebuild",
+            "change_scope": "global",
+            "reason": "strategy_missing_after_plan",
+        }),
         "plan": plan_out,
         "compile": compile_out,
         "warnings": {
             "plan": plan_warnings,
             "compile": compile_warnings,
         },
+        "fatal_errors": [str(e) for e in (compile_out.get("fatal_errors") or []) if str(e).strip()],
         "planner_raw_response": planner_raw,
     }
 
