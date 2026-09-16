@@ -1,14 +1,12 @@
 """Heavy edit tool: run the single-page pipeline for one or more pages.
 
 This is the agent's workhorse. Each edit runs the vendored LangGraph pipeline
-(`run_pipeline_once`) which mutates shared per-project disk state, so turns are
-serialized per project and progress is published onto the SSE channel.
+(`run_pipeline_once`) which mutates page-scoped state and publishes progress
+onto the SSE channel.
 """
 
 from __future__ import annotations
 
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from langchain.tools import ToolRuntime
@@ -17,28 +15,22 @@ from typing_extensions import NotRequired, TypedDict
 
 from agent_backend.agent.models import agent_model_name
 from agent_backend.agent.tools.context import (
+    assert_unique_page_jobs,
     emit,
-    project_lock,
+    execute_page_jobs,
+    page_job,
+    require_agent_run_id,
     require_project_id,
     require_session_id,
     workspace_for,
 )
 from agent_backend.agent.tools.page_understanding import ensure_page_understanding
 from agent_backend.agent.tools.deck_style import public_style_row, require_ready_style
-from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.graph import (
+from agent_backend.agent.tools.pipeline_without_reference_image.edit_graph import (
     run_pipeline_once,
 )
 from agent_backend.workspace import pageorder
 from agent_backend.workspace.repo import record_turn
-
-
-# Cap concurrent page pipelines per batch. Each page runs its own step1-4 (LLM
-# calls + a Playwright QA render), so this bounds peak memory / browser count and
-# upstream API concurrency. Override via env for tuning.
-try:
-    MAX_PARALLEL_PAGES = max(1, int(os.environ.get("PPT_MAX_PARALLEL_PAGES", "3")))
-except ValueError:
-    MAX_PARALLEL_PAGES = 3
 
 
 class PageEdit(TypedDict):
@@ -51,20 +43,18 @@ class PageEdit(TypedDict):
 def edit_pages(edits: list[PageEdit], runtime: ToolRuntime) -> dict[str, Any]:
     """Apply edits to one or more pages by running the single-page pipeline.
 
-    `edits` is a list of `{"page_ref": "page@<id>", "demand": "<natural-language
-    instruction for that page>"}`. Each demand should be a complete, standalone
-    instruction (e.g. "translate the body to bilingual, English left / Chinese
-    right" or "make the title font larger and use a blue background"). Edits run
-    sequentially and are applied directly (no confirmation). Returns per-page
-    success, the turn directory, and any errors.
+    `edits` contains stable page references and complete standalone natural-language
+    demands. The internal planner chooses and combines its available page-editing
+    skills from the demand and current page state. Independent pages run concurrently
+    through the shared page coordinator. Returns per-page success and errors.
     """
     pid = require_project_id(runtime)
+    run_id = require_agent_run_id(runtime)
     try:
         sid = require_session_id(runtime)
     except Exception:
         sid = None
     model = agent_model_name()
-    lock = project_lock(pid)
     paths = workspace_for(pid)
 
     parsed: list[dict[str, Any]] = []
@@ -88,19 +78,20 @@ def edit_pages(edits: list[PageEdit], runtime: ToolRuntime) -> dict[str, Any]:
     style_needed = any(bool(item.get("use_deck_style")) for item in parsed)
     deck_style_row = require_ready_style(pid, interrupt_when_unready=True) if style_needed else None
 
-    emit(pid, {"type": "batch_started", "project_id": pid, "count": len(parsed)})
+    emit(pid, {"type": "batch_started", "project_id": pid, "count": len(parsed), "agent_run_id": run_id})
+    assert_unique_page_jobs([int(item["slot"]) for item in parsed])
 
     def _run_one(i: int, page: int, demand: str, slot: int | None, use_deck_style: bool) -> dict[str, Any]:
         """Run one page's pipeline end-to-end. Safe to call from a worker thread:
         each page writes only its own per-page files; the sole shared write
-        (preview/index.html) is serialized by index_rebuild_lock inside step3/4.
+        Page-local state is protected by the shared page coordinator.
         """
         if slot is None:
             err = f"page {page} does not exist in this deck"
-            emit(pid, {"type": "task_failed", "page": page, "slot": None, "demand": demand, "index": i, "error": err})
+            emit(pid, {"type": "task_failed", "page": page, "slot": None, "demand": demand, "index": i, "error": err, "agent_run_id": run_id})
             return {"page": page, "ok": False, "error": err}
 
-        emit(pid, {"type": "task_started", "page": page, "slot": slot, "demand": demand, "index": i})
+        emit(pid, {"type": "task_started", "page": page, "slot": slot, "demand": demand, "index": i, "agent_run_id": run_id})
         try:
             understanding = ensure_page_understanding(
                 paths=paths,
@@ -109,7 +100,7 @@ def edit_pages(edits: list[PageEdit], runtime: ToolRuntime) -> dict[str, Any]:
                 display_page=page,
                 model=model,
                 focus=[],
-                agent_run_id="",
+                agent_run_id=run_id,
             )
             core = understanding.get("core")
             understanding_status = str(understanding.get("_status") or "cached")
@@ -127,6 +118,7 @@ def edit_pages(edits: list[PageEdit], runtime: ToolRuntime) -> dict[str, Any]:
                 understanding_status=understanding_status,
                 deck_style=deck_style_row.get("style_json") if use_deck_style and isinstance(deck_style_row, dict) else None,
                 deck_style_revision=int(deck_style_row.get("revision") or 0) if use_deck_style and isinstance(deck_style_row, dict) else 0,
+                agent_run_id=run_id,
             )
             turn_dir = final_state.get("turn_dir")
             # Turn success is decided SOLELY by whether step3 (reassemble)
@@ -161,6 +153,7 @@ def edit_pages(edits: list[PageEdit], runtime: ToolRuntime) -> dict[str, Any]:
                     "turn_dir": turn_dir,
                     "errors": [],
                     "prepare_reread_png": False,
+                    "agent_run_id": run_id,
                 },
             )
             if ok:
@@ -178,36 +171,31 @@ def edit_pages(edits: list[PageEdit], runtime: ToolRuntime) -> dict[str, Any]:
                 ok=False,
                 error=err,
             )
-            emit(pid, {"type": "task_failed", "page": page, "slot": slot, "demand": demand, "index": i, "error": err})
+            emit(pid, {"type": "task_failed", "page": page, "slot": slot, "demand": demand, "index": i, "error": err, "agent_run_id": run_id})
             return {"page": page, "ok": False, "error": err}
 
-    # Pages of one batch target DIFFERENT slots (different folders), so they can
-    # run concurrently. We hold the project lock for the WHOLE batch so structural
-    # ops (add/delete/reorder/sync) still can't interleave a running edit, then
-    # fan the pages out onto a small pool. Results are reassembled in input order.
-    results_by_index: dict[int, dict[str, Any]] = {}
-    max_workers = min(MAX_PARALLEL_PAGES, len(parsed))
-    with lock:
-        if style_needed:
-            latest = public_style_row(pid)
-            if latest.get("status") != "ready" or not isinstance(latest.get("style_json"), dict):
-                raise RuntimeError("deck style became unavailable before editing")
-            deck_style_row = latest
-        if max_workers <= 1:
-            for i, item in enumerate(parsed):
-                results_by_index[i] = _run_one(i, item["page"], item["demand"], item["slot"], bool(item.get("use_deck_style")))
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="edit") as pool:
-                futures = {
-                    pool.submit(_run_one, i, item["page"], item["demand"], item["slot"], bool(item.get("use_deck_style"))): i
-                    for i, item in enumerate(parsed)
-                }
-                for fut in as_completed(futures):
-                    idx = futures[fut]
-                    results_by_index[idx] = fut.result()
+    if style_needed:
+        latest = public_style_row(pid)
+        if latest.get("status") != "ready" or not isinstance(latest.get("style_json"), dict):
+            raise RuntimeError("deck style became unavailable before editing")
+        deck_style_row = latest
+
+    def _run_coordinated(i: int) -> dict[str, Any]:
+        item = parsed[i]
+        with page_job(pid, int(item["slot"])):
+            page = pageorder.position_for_slot(paths, int(item["slot"]))
+            if page is None:
+                return {"page": item["page"], "slot": item["slot"], "ok": False, "error": "page_not_found"}
+            return _run_one(i, int(page), item["demand"], item["slot"], bool(item.get("use_deck_style")))
+
+    results_by_index = execute_page_jobs(
+        pid,
+        [(i, int(item["slot"])) for i, item in enumerate(parsed)],
+        _run_coordinated,
+    )
 
     results = [results_by_index[i] for i in range(len(parsed))]
-    emit(pid, {"type": "batch_finished", "project_id": pid})
+    emit(pid, {"type": "batch_finished", "project_id": pid, "agent_run_id": run_id})
 
     ok = all(r.get("ok") for r in results)
     return {"project_id": pid, "ok": ok, "results": results}

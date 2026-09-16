@@ -13,10 +13,11 @@ import base64
 import hashlib
 import mimetypes
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
-from .paths import WorkspacePaths, write_json
+from .paths import WorkspacePaths, read_json, write_json
 
 
 DATA_URI_RE = re.compile(r"^data:(image/[\w.+-]+);base64,(.*)$", re.DOTALL)
@@ -125,3 +126,34 @@ def clear_staged_candidates(paths: WorkspacePaths, slot: int) -> None:
                 child.unlink()
         except OSError:
             continue
+
+
+def consume_pending_uploads_for_run(
+    paths: WorkspacePaths,
+    slot: int,
+    run_id: str,
+) -> None:
+    """Remove only one successfully committed run's pending upload records."""
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return
+    manifest = paths.pending_uploads_json(int(slot))
+    if manifest.exists():
+        try:
+            payload = read_json(manifest)
+            uploads = payload.get("uploads") if isinstance(payload, dict) else []
+            remaining = [
+                item
+                for item in (uploads if isinstance(uploads, list) else [])
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get("run_id") or "") == run_id
+                )
+            ]
+            write_json(
+                manifest,
+                {"schema_version": "pending_uploads_v1", "uploads": remaining},
+            )
+        except Exception:
+            return
+    shutil.rmtree(page_asset_uploads_dir(paths, int(slot)) / run_id, ignore_errors=True)

@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from agent_backend.agent.tools.table_spec import slim_table_for_model, validate_table_spec
+
 
 DEFAULT_MODEL = os.getenv("PPT_LLM_MODEL", "claude-opus-4-8")
 
@@ -208,7 +210,7 @@ def _iter_text_items_from_plan_page(plan_page: dict[str, Any]) -> list[dict[str,
     out: list[dict[str, Any]] = []
     next_id = 0
 
-    def emit(*, kind: str, text: str) -> None:
+    def emit(*, kind: str, text: str, block_id: str = "") -> None:
         nonlocal next_id
         t = (text or "").strip()
         if not t:
@@ -218,24 +220,17 @@ def _iter_text_items_from_plan_page(plan_page: dict[str, Any]) -> list[dict[str,
                 "id": f"t{next_id}",
                 "kind": str(kind or "body"),
                 "text": t,
+                "block_id": str(block_id or ""),
             }
         )
         next_id += 1
 
-    def blocks_from(blk: dict[str, Any]) -> Iterable[tuple[str, str]]:
-        kind = str(blk.get("kind") or "body")
-        if kind == "bullets":
-            for it in (blk.get("items") or []):
-                if isinstance(it, dict) and isinstance(it.get("text"), str):
-                    yield ("bullet_item", str(it.get("text") or ""))
-        else:
-            yield (kind, str(blk.get("text") or ""))
-
     for blk in (plan_page.get("blocks") or []):
         if not isinstance(blk, dict):
             continue
-        for kind, txt in blocks_from(blk):
-            emit(kind=kind, text=txt)
+        # The adapter has already split real HTML paragraphs and table cells.
+        # Do not regroup or split them here; inline spans are not paragraphs.
+        emit(kind="body", text=str(blk.get("text") or ""), block_id=str(blk.get("id") or ""))
 
     return out
 
@@ -309,6 +304,54 @@ def _identity_paragraphs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for it in items
         if isinstance(it, dict) and str(it.get("id") or "")
     ]
+
+
+def _apply_model_roles(
+    paragraphs: list[dict[str, Any]], items: list[dict[str, Any]], model_obj: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Apply visual role labels without changing deterministic text boundaries."""
+    by_block = {str(it.get("block_id")): idx for idx, it in enumerate(items) if it.get("block_id")}
+    roles = model_obj.get("text_roles")
+    if not isinstance(roles, list):
+        return paragraphs
+    out = [dict(p) for p in paragraphs]
+    for role in roles:
+        if not isinstance(role, dict):
+            continue
+        block_id = str(role.get("block_id") or "")
+        kind = str(role.get("kind") or "").strip()
+        idx = by_block.get(block_id)
+        if idx is not None and kind:
+            out[idx]["kind"] = kind
+    return out
+
+
+def _build_native_tables(*, raw_tables: Any, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Deprecated helper retained only for old callers; native extraction happens upstream."""
+    warnings: list[str] = []
+    if not isinstance(raw_tables, list):
+        return [], warnings
+    block_to_ref = {str(it.get("block_id")): str(it.get("id")) for it in items if it.get("block_id")}
+    out: list[dict[str, Any]] = []
+    for idx, table in enumerate(raw_tables):
+        if not isinstance(table, dict):
+            warnings.append(f"table[{idx}]_not_object")
+            continue
+        cells_out: list[dict[str, Any]] = []
+        for cell in table.get("cells") or []:
+            if not isinstance(cell, dict):
+                continue
+            ref = block_to_ref.get(str(cell.get("ref") or ""))
+            if ref:
+                cells_out.append({"row": cell.get("row"), "col": cell.get("col"), "ref": ref})
+        try:
+            rows, cols = int(table.get("rows")), int(table.get("cols"))
+        except (TypeError, ValueError):
+            warnings.append(f"table[{idx}]_bad_dims")
+            continue
+        if rows > 0 and cols >= 2 and cells_out:
+            out.append({"id": str(table.get("id") or f"tbl{len(out)}"), "rows": rows, "cols": cols, "cells": cells_out})
+    return out, warnings
 
 
 def _paragraph_index_to_text_id(paragraphs: list[dict[str, Any]]) -> dict[int, str]:
@@ -444,36 +487,36 @@ def _apply_paragraphs_to_texts(*, items: list[dict[str, Any]], paragraphs: list[
     return out
 
 
-_SYSTEM_PROMPT = """You are the "UNDERSTAND" stage of a single-page PPT-editing pipeline. You look at ONE rendered slide and produce a clean structured understanding of it. You do FOUR things in one pass.
+_SYSTEM_PROMPT = """You are the "UNDERSTAND" stage of a single-page PPT-editing pipeline. You look at ONE rendered slide and produce a clean structured understanding of it.
+
+IMPORTANT PPTIST INPUT CONTRACT
+- The source is already parsed from PPTist JSON. Each `block` is one real HTML paragraph or one native table cell. Inline spans are already concatenated inside that block.
+- Never merge, split, reorder, rewrite, translate, or correct block text. Paragraph boundaries and native table structure are authoritative and are preserved by fixed code.
+- Tables are already supplied as deterministic `tables`; do not detect, invent, or alter tables from the image.
+- Your text job is only to assign a visual `kind` to each block. Return one `text_roles` item for every block id.
+- Also describe images, the original layout, and the compact common page facts. If focus requests are supplied, answer them in `focused_results`.
+
+OUTPUT CONTRACT (the fixed code supplies text and tables; your response supplies labels and observations)
+{
+  "text_roles": [{"block_id":"b0","kind":"title|subheading|body|bullet_item|caption|label|date"}],
+  "images": [{"id":"...","description_en":"..."}],
+  "original_layout_description_en":"...",
+  "common": {"title":"","page_type":"","topic":"","summary":"","key_points":[],"language":""},
+  "focused_results": [{"focus":"...","answer":"..."}]
+}
+
+Do not output markdown or commentary. The remaining rules below describe the visual observations and image descriptions.
 
 INPUTS
 - `page_png`: the full-page render of the slide (look at it).
 - `asset_images`: the extracted raw images on the page, each preceded by its image id.
-- `fragments`: the text on the page, already extracted deterministically from the source. Each fragment has an id (t0, t1, ...) and its text. These fragments are often OVER-SPLIT: one sentence/paragraph may be broken across several fragments because of line breaks. (Fragments carry NO role/kind hint — YOU assign every paragraph's `kind` purely by looking at the slide.)
+- `blocks`: the text on the page, already extracted deterministically from PPTist JSON. Each block has an id (b0, b1, ...) and its text. Blocks carry no role hint; assign every block's `kind` purely from the slide.
 
-TASK 1 — RECOMPOSE + RE-TYPE THE TEXT (`paragraphs`)
-Merge the fragments back into natural reading paragraphs, and assign each paragraph the correct role by LOOKING at the slide.
-- Merge fragments that clearly belong to one sentence/paragraph (e.g. a sentence split across a line break). Fragments are a flat, ordered list with no grouping; decide what belongs together purely by reading the slide.
-- Judge `kind` from the visual (e.g. "title", "subheading", "body", "bullet_item", "caption", "label", "date"): decide it purely from what the slide shows. Fragments carry no kind hint.
-- ABSOLUTE RULE — do NOT change any characters. You may only re-group and re-order-at-join existing text. When you merge fragment A then B, `text` MUST equal A's text followed by B's text (a single space at the join is allowed; nothing else added, removed, or substituted). Never translate, rewrite, fix typos, or change punctuation.
-- Every fragment id MUST appear in EXACTLY ONE paragraph's `sources`. No missing, no duplicate, no invented ids. `sources[0]` is the head fragment.
-- If two fragments are clearly separate lines/labels/titles, keep them as separate paragraphs (do NOT force-merge).
+TASK 1 — ASSIGN VISUAL ROLES (`text_roles`)
+Assign each supplied block the correct role by LOOKING at the slide. Fixed code preserves every block's text and boundary.
 
-Within a paragraph, preserve its internal visual line/item structure via `segments` ONLY when the paragraph is a real multi-item list:
-- `segments` is an array of strings that splits the paragraph into the ORIGINAL visible lines/items in reading order.
-- OMIT the `segments` field entirely for a normal sentence/paragraph (anything that is a single line/item). A single-segment `segments` carries no information — do NOT emit it. In that case output only `text`.
-- ONLY emit `segments` for a clear enumerated list (timeline/date list, numbered list, bullet list) that has TWO OR MORE items. Then use one segment per item/row so the structure survives reread, and do NOT collapse the list into one giant segment.
-- When present, `segments` MUST have length >= 2, and `text` MUST equal the EXACT concatenation of all `segments` (no separators; do not insert newlines). Every character must come from the input fragments; you may only choose segmentation boundaries.
-
-TASK 1B — DETECT TABLES (`tables`)
-Decide, PURELY by LOOKING at the image, whether the slide contains a real TABLE. Be CONSERVATIVE: only emit a table when the slide shows UNMISTAKABLE table structure. When in doubt, output NO table.
-- A real table REQUIRES clear VISUAL grid evidence, such as: visible row/column separator lines or cell borders, a ruled grid, a shaded header row or alternating row-band fills, or a genuine matrix of values organized into labelled rows AND columns. Visual evidence outweighs the text content — never infer a table from what the words say.
-- A plain LIST is NOT a table. Ordinary bullet lists, numbered lists, and timelines (e.g. "2012.06 ... / 2013.10 ...") are LISTS even when their items line up neatly row-by-row. Row-by-row alignment ALONE is NOT enough; do NOT treat aligned text as a table just because it looks tidy or because you could split each line into a date + description.
-- NEVER output a single-column table (`cols` == 1): one column is just a list, so it carries no table meaning. A table must have `cols` >= 2 with genuinely distinct columns.
-- Do NOT rely on coordinates or fragment order to guess a grid; rely on the grid lines / cell borders / shading you actually SEE.
-- For each table, output: an `id` (e.g. "tbl0"), `rows` (int), `cols` (int >= 2), and `cells` — a row-major list of { "row": r, "col": c, "para": <index into `paragraphs`> } (all 0-based). Omit empty cells.
-- If ONE paragraph is a column of many rows (you emitted one `segment` per row in TASK 1), emit one cell PER ROW all pointing to that SAME `para` index; the `row` disambiguates which segment goes in which row. Prefer combining parallel columns (e.g. a date column + a text column + its translation column) into ONE table with multiple `col` values, not several separate tables.
-- If there are NO tables (the common case), output `"tables": []`.
+TASK 1B — TABLES
+Do not detect tables. The supplied `tables` structure is authoritative and is copied by fixed code.
 
 TASK 2 — DESCRIBE EACH IMAGE (`images`), English
 - One English description per image id in `asset_images`. Cover: what it shows (high level), its role on the page (hero / supporting / icon / logo / chart / background), and a rough relative placement.
@@ -483,13 +526,13 @@ TASK 3 — DESCRIBE THE ORIGINAL LAYOUT (`original_layout_description_en`), Engl
 - One short paragraph (3-6 sentences) on the original composition: structure, relative placement (top/bottom/left/right/center, bands, columns, cards, whitespace), and the dominant COLOUR TONE per distinct region in plain English ("warm orange top band", "near-white body"). No hex codes. No OCR of exact text.
 - ALSO mention, BRIEFLY, any purely DECORATIVE graphics you see — color blocks/bands, cards or rounded rectangles behind text, circles/dots/nodes, connector lines, timeline axes, dividers, arrows, and similar simple shapes — noting their rough placement and color tone. Keep this secondary and understated: these shapes are decoration, not the meaning-bearing content. The genuinely important elements are the text, tables, and images; decorations are just context for how the page looks. Do NOT over-describe them or let them dominate the paragraph.
 
-OUTPUT — STRICT JSON only, no markdown, no commentary:
+OUTPUT — STRICT JSON only, no markdown, no commentary. Use the compact output contract at the top; do not return paragraphs or tables:
 {
-  "paragraphs": [ { "kind": "body", "sources": ["t3","t2"], "text": "..." },
-                  { "kind": "body", "sources": ["t5"], "text": "...", "segments": ["item 1","item 2"] } ],
-  "tables": [ { "id": "tbl0", "rows": 6, "cols": 2, "cells": [ {"row":0,"col":0,"para":0}, {"row":0,"col":1,"para":1} ] } ],
+  "text_roles": [ {"block_id":"b0", "kind":"title"} ],
   "images": [ { "id": "p1_i0", "description_en": "..." } ],
-  "original_layout_description_en": "..."
+  "original_layout_description_en": "...",
+  "common": {"title":"", "page_type":"", "topic":"", "summary":"", "key_points":[], "language":""},
+  "focused_results": []
 }
 """
 
@@ -500,6 +543,7 @@ def understand_step(
     api_key: str | None = None,
     model: str = DEFAULT_MODEL,
     dry_run: bool = False,
+    focus_requests: list[str] | None = None,
 ) -> dict[str, Any]:
     warnings: list[str] = []
 
@@ -552,9 +596,16 @@ def understand_step(
     original_layout_description_en = ""
     used_paragraphs: list[dict[str, Any]]
     tables_out: list[dict[str, Any]] = []
+    for table in plan_page.get("tables") or []:
+        try:
+            tables_out.append(validate_table_spec(table))
+        except ValueError as exc:
+            warnings.append(f"invalid_native_table: {exc}")
+    common_out: dict[str, Any] = {}
+    focused_results: list[dict[str, str]] = []
 
     if dry_run:
-        warnings.append("dry_run_identity_recompose")
+        warnings.append("dry_run_identity_understanding")
         used_paragraphs = _identity_paragraphs(items)
     else:
         base_url, key = _resolve_backend(api_key)
@@ -575,10 +626,14 @@ def understand_step(
             "page_size_pt": page_size_pt,
             "palette": palette,
             "image_ids": [im["id"] for im in images_out],
-            "fragments": [
-                {"id": it["id"], "text": it["text"]}
+            "blocks": [
+                {"id": str(it["block_id"] or it["id"]), "text": it["text"]}
                 for it in items
             ],
+            # Table geometry/style/IDs are fixed-code state. The model only
+            # receives the small content-and-span projection.
+            "tables": [slim_table_for_model(t) for t in tables_out],
+            "focus_requests": [str(x) for x in (focus_requests or []) if str(x).strip()],
         }
         user_text = "page_png is the first image. asset_images follow, each preceded by its id.\n\n" + json.dumps(
             payload, ensure_ascii=False, indent=2
@@ -598,20 +653,20 @@ def understand_step(
             warnings.append(f"understand_call_error: {err or 'invalid_json'}")
             used_paragraphs = _identity_paragraphs(items)
         else:
-            paragraphs = obj.get("paragraphs")
-            ok, reasons = _validate_paragraphs(
-                paragraphs=paragraphs if isinstance(paragraphs, list) else [], items_by_id=items_by_id
-            )
-            if not ok:
-                warnings.append(f"recompose_validation_failed: {reasons[:8]}")
-                used_paragraphs = _identity_paragraphs(items)
-            else:
-                used_paragraphs = [p for p in paragraphs if isinstance(p, dict)]
+            # Text and table structure are fixed-code outputs. The model can
+            # only add visual role labels, so malformed/legacy paragraph output
+            # can never alter the authoritative text boundaries.
+            used_paragraphs = _apply_model_roles(_identity_paragraphs(items), items, obj)
 
-            tables_out, table_warns = _build_tables(
-                raw_tables=obj.get("tables"), paragraphs=used_paragraphs
-            )
-            warnings.extend(table_warns)
+            common_candidate = obj.get("common")
+            if isinstance(common_candidate, dict):
+                common_out = common_candidate
+            focused_candidate = obj.get("focused_results")
+            if isinstance(focused_candidate, list):
+                focused_results = [
+                    {"focus": str(x.get("focus") or ""), "answer": str(x.get("answer") or "")}
+                    for x in focused_candidate if isinstance(x, dict) and str(x.get("focus") or "").strip()
+                ]
 
             desc_by_id: dict[str, str] = {}
             for it in (obj.get("images") or []):
@@ -636,7 +691,7 @@ def understand_step(
     new_texts = _apply_paragraphs_to_texts(items=items, paragraphs=used_paragraphs)
 
     out: dict[str, Any] = {
-        "schema_version": "understand_output_v1",
+        "schema_version": "understand_output_v2",
         "page_num": page_num,
         "page_id": page_id,
         "page_size_pt": page_size_pt,
@@ -651,10 +706,15 @@ def understand_step(
             "schema_version": "recompose_v1",
             "input_fragment_count": len(items),
             "output_paragraph_count": len(new_texts),
-            "merged_paragraph_count": max(0, len(items) - len(new_texts)),
+            "merged_paragraph_count": 0,
         },
         "warnings": warnings,
     }
+    # These are consumed by the shared page-understanding service and removed
+    # before the v1 core is persisted. Keeping them here lets the first full
+    # understanding call produce core/common/focus in one model request.
+    out["_common"] = common_out
+    out["_focused_results"] = focused_results
     return out
 
 
@@ -695,4 +755,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

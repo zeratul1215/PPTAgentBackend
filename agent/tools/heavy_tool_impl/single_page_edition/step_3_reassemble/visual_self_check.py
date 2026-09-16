@@ -64,6 +64,9 @@ def _normalize_critic(value: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     verdict = str(value.get("verdict") or "").strip().lower()
     severity = str(value.get("severity") or "").strip().lower()
+    # The current critic contract uses only pass/revise verdicts.
+    if severity in {"critical", "high"}:
+        severity = "major"
     if verdict not in {"pass", "revise"} or severity not in {"none", "minor", "major"}:
         return None
     issues = value.get("issues") if isinstance(value.get("issues"), list) else []
@@ -192,11 +195,15 @@ def run_visual_self_check(
         _write_text(turn_dir / "step3_visual_check_raw.txt", raw or "")
         critic = _normalize_critic(_extract_json(raw))
         if critic is None:
-            result.update({"status": "error", "reason": "invalid_critic_json"})
+            result.update({"status": "unavailable", "reason": "invalid_critic_json"})
             _write_json(turn_dir / "step3_visual_check.json", result)
             return {"page_block": page_block, "visual_self_check": result}
         _write_json(turn_dir / "step3_visual_check.json", critic)
-        result.update({"status": "passed", "severity": critic["severity"], "verdict": critic["verdict"]})
+        result.update({
+            "status": "passed" if critic["verdict"] == "pass" else "needs_repair",
+            "severity": critic["severity"],
+            "verdict": critic["verdict"],
+        })
         if critic["verdict"] != "revise" or critic["severity"] != "major":
             return {"page_block": page_block, "visual_self_check": result}
 

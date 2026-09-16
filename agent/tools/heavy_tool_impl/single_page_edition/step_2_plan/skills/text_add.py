@@ -24,12 +24,13 @@ from .base import (
     SkillResult,
     _append_added_text,
     _call_claude_json,
+    _text_targets,
 )
 
 
 # Kinds the new block MAY use — the SAME open set already present on pages; no
 # whitelist (there is no "kind you can't add"). The model self-selects from the
-# objective's semantics and falls back to "body" (mirrors `_append_derived_text`).
+# objective's semantics and falls back to "body".
 _ADD_SYSTEM_PROMPT = """You are the "ADD TEXT" subagent for a single-page PPT-editing pipeline.
 
 You AUTHOR one or more NEW text blocks that the user asked to add to the page.
@@ -39,10 +40,11 @@ You are given:
 - `objective`: what THIS skill must add, in natural language — the content to
   create (and possibly its role, e.g. "add a closing takeaway line", "add three
   bullet points summarizing the benefits", "add a subtitle under the title").
-- `items`: EVERY text item already on the page (each with `id`, `kind`, `text`).
-  These are CONTEXT ONLY — so your new text matches the page's language, tone,
-  terminology, and level of detail. Do NOT edit, rewrite, translate, or repeat
-  any existing item; you only CREATE new blocks.
+- `items`: semantic context already on the page, including ordinary text,
+  shape text, table-cell text, and factual image descriptions. These are
+  CONTEXT ONLY, so the new text matches the page's language, tone, terminology,
+  and level of detail. Do NOT edit or repeat an existing item; only CREATE new
+  text blocks.
 
 Author the new block(s):
 1) Write each block's `text` to satisfy `objective`, in the SAME language as the
@@ -96,9 +98,9 @@ def _run_add(
     objective = str(intent.get("objective") or "").strip()
     if not objective:
         warnings.append(f"add_empty_objective[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
-    texts: list[dict[str, Any]] = state.get("texts") or []
+    texts: list[dict[str, Any]] = _text_targets(state)
     context_items = [
         {
             "id": str(t.get("id") or ""),
@@ -108,11 +110,23 @@ def _run_add(
         for t in texts
         if isinstance(t, dict) and str(t.get("text") or "").strip()
     ]
+    for image in state.get("images") or []:
+        if not isinstance(image, dict):
+            continue
+        description = str(image.get("description_en") or "").strip()
+        if description:
+            context_items.append(
+                {
+                    "id": str(image.get("id") or ""),
+                    "kind": "image_description",
+                    "text": description,
+                }
+            )
 
     if dry_run:
         _append_added_text(state=state, text=f"[added] {objective}"[:120], kind="body")
         warnings.append(f"dry_run_stub_add: {iid}")
-        return SkillResult(warnings=warnings, triggered_visual=True)
+        return SkillResult(warnings=warnings, status="applied", triggered_visual=True)
 
     payload = {
         "user_request": user_request,
@@ -129,10 +143,10 @@ def _run_add(
     )
     if err:
         warnings.append(f"add_call_error[{iid}]: {err}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
     if not isinstance(obj, dict) or not isinstance(obj.get("blocks"), list):
         warnings.append(f"add_invalid_response[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     added = 0
     for b_idx, block in enumerate(obj.get("blocks") or []):
@@ -157,36 +171,21 @@ def _run_add(
 
     if added == 0:
         warnings.append(f"add_added_nothing[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
+        return SkillResult(warnings=warnings, status="failed", triggered_visual=False)
 
     warnings.append(f"add_applied[{iid}]: {added} block(s)")
     # New elements change the element set → re-flow so they land well. No default
     # visual detail: there is no reusable default placement for arbitrary added
     # text (unlike bilingual). If the user gave a placement, it's already in
     # visual_intent.requirements_text (visual_detail_provided=true) and wins.
-    return SkillResult(warnings=warnings, triggered_visual=True)
+    return SkillResult(warnings=warnings, status="applied", triggered_visual=True)
 
 
-_ADD_PLAN_DOC = """  Add BRAND-NEW text to the page (a line/paragraph/bullet list that is not
-  already there). Use for "加一句话/新增一段/补一个副标题/add a closing line/
-  add three bullets summarizing X". Do NOT use for editing existing text
-  (that's text.rewrite) or translating (text.translate).
-  `objective` (natural language) MUST state WHAT to add (the content, and its
-  role if the user implied one, e.g. "a subtitle", "a footer note", "three
-  bullets about ..."). No `params` — the executor authors the text from your
-  objective + the page context. Do NOT put placement in `objective`; if the user
-  specified WHERE the new text should go, that is a visual requirement (set the
-  intent's `visual_detail_provided=true` and copy it into
-  visual_intent.requirements_text). Adds new elements, so it triggers a visual
-  re-layout."""
-
-
-_ADD_ORDERING_NOTE = (
-    "Authors new text from the page context; usually runs AFTER redact/rewrite/"
-    "translate so it sees the FINAL existing text and matches its wording, though "
-    "it does not depend on them. Preference, not a rule — honor the user's stated "
-    "order if they give one."
-)
+_ADD_PLAN_DOC = """  Capability: add brand-new text blocks that do not already
+  exist on the page. The natural-language objective must specify the content or
+  permitted generation scope and the intended semantic role. The executor uses
+  the objective and current page context. Placement belongs in visual_intent.
+  Adding text may require visual re-layout."""
 
 
 SKILL = Skill(
@@ -196,5 +195,5 @@ SKILL = Skill(
     plan_doc=_ADD_PLAN_DOC,
     repair=_repair_add_params,
     execute=_run_add,
-    ordering_note=_ADD_ORDERING_NOTE,
+    ordering_note="Usually follows edits whose results the new text must summarize, match, or otherwise depend on; it is independent when no such dependency exists.",
 )

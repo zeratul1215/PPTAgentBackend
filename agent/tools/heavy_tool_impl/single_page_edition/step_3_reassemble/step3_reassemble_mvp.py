@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from agent_backend.agent.tools.table_spec import validate_table_spec
 
 
 DEFAULT_MODEL = os.getenv("PPT_LLM_MODEL", "claude-opus-4-8")
@@ -30,7 +31,7 @@ _SYSTEM_PROMPT_BASE = """You are a “single-page HTML code generator”.
 You will receive:
 - `page_state` (JSON): page meta + content. Includes `page_size_pt`, `palette` (primary + fills; only a hint),
   `texts[]` (id/kind/text/segments), `images[]` (id/src/display sizes/description_en),
-  `tables[]` (OPTIONAL, authoritative table structure: each `{id, rows, cols, cells:[{row,col,ref}]}` — see the table
+  `tables[]` (OPTIONAL, authoritative native table structure: each `{id,colWidths,cellMinHeight,outline,theme,data[][]}` — see the table
   rules), and `required_refs` (the ONLY allowed reference ids).
 - `layout_notes_brief` (plain text): a short skeleton-level layout description for THIS page (secondary hint).
 - `css_library_doc` (plain text): the base CSS that is ALWAYS loaded. It only fixes the slide size (`.page` =
@@ -191,10 +192,8 @@ Hard constraints (MUST follow — these are the ONLY styling limits):
   - Put a text's `data-ref` on the BLOCK/FLEX/GRID container whose full rendered border box should become the editable
     PPTist text box. Never put it only on an inner inline `<span>` or another shrink-wrapped styling child. Inner spans
     may carry font/color emphasis, but the outer `data-ref` container owns width, padding, wrapping, and alignment.
-  - THE ONLY EXCEPTION is a DECLARED `page_state.tables[]` column (see the table rules below): when a text node is a
-    column of a declared `<table>`, its `data-ref="tN"` is placed on that text's cell in EVERY row, so it repeats once
-    per row. This is allowed ONLY when every occurrence of that id is a `<td>`/`<th>` inside the same `<table>`. Outside
-    that case, never repeat a `data-ref`.
+  - Tables use the table id once on `<table>` and cell ids on visible `<td>`/`<th>` elements. Never reuse a text
+    `data-ref` for table cells.
   - Do NOT use any `data-ref` values outside `page_state.required_refs.all`. Do NOT put the same `data-ref` twice on the
     same element.
 - Space-first sizing (IMPORTANT): shrinking the font is the LAST resort, NOT the first move. Text should fill the space it
@@ -216,18 +215,10 @@ Hard constraints (MUST follow — these are the ONLY styling limits):
   achievement list, label-and-description list, text over an SVG shape/card, or any other ordinary text structure is
   NOT a table merely because it has visually aligned columns. Render those with normal HTML text containers
   (`div`/`p`/`span`) using flex or grid; their text must remain ordinary PPTist text or shape-contained text.
-  * DECLARED table (AUTHORITATIVE): when `page_state.tables[]` is present, each entry `{id, rows, cols, cells:[{row,col,ref}]}`
-    is an EXPLICIT instruction: build exactly ONE `<table>` with that many `rows`x`cols`. Emit one `<tr>` per row and, in
-    each row, one `<td>`/`<th>` per column in `col` order; put a cell's `ref` as the `data-ref` on that `<td>`/`<th>`.
-    When several cells in the same column share one `ref` (a text node with one segment per row), that column's `ref`
-    repeats once per row — place that node's row-th `segment` in the `<td>` for that row, so the segments cover the
-    column top-to-bottom in order and concatenate back to the verbatim text. The `<tr>` element is what keeps columns
-    aligned even when a cell wraps to multiple lines. NEVER split a declared table into multiple `<table>` elements or
-    parallel `<div>` columns, and never align separate tables by matching row heights. This overrides your visual guess.
-  * SINGLE-node table (one text): put `data-ref="tN"` on the `<table>` element. If `segments` is present, render EACH
-    segment as its own `<tr>` (in order), splitting the segment's parts across `<td>` cells; the concatenation of the
-    row texts MUST still equal the verbatim text (no added/removed characters, no invented column labels beyond what the
-    text already contains).
+  * DECLARED table (AUTHORITATIVE): each entry has a native `data[][]` matrix. Build exactly one
+    `<table data-ref="table-id">` with a `<colgroup>` for every logical column. Render each visible matrix cell with
+    `data-cell-id="cell-id"`, preserving its `rowspan` and `colspan`; covered placeholders emit no extra `<td>`.
+    Cell text belongs inside that cell, not in a top-level text ref. Never split a declared table into parallel divs.
   * Table cell / row / header backgrounds (header shading, zebra striping, a solid cell fill) are the ONE case where a
     CSS `background`/`background-color` IS allowed — cell fills map to native editable PowerPoint table cell fills, so
     they do NOT need to be inline SVG. All OTHER colored graphics on the page still follow the inline-SVG rule.
@@ -589,39 +580,9 @@ def _extract_page_state(step2: dict[str, Any], *, images_dir: Path | None = None
         if not isinstance(tbl, dict):
             continue
         try:
-            rows = int(tbl.get("rows"))
-            cols = int(tbl.get("cols"))
-        except (TypeError, ValueError):
+            tables_out.append(validate_table_spec(tbl))
+        except ValueError:
             continue
-        if rows <= 0 or cols <= 0:
-            continue
-        cells_in = tbl.get("cells")
-        if not isinstance(cells_in, list):
-            continue
-        cells_out: list[dict[str, Any]] = []
-        for cell in cells_in:
-            if not isinstance(cell, dict):
-                continue
-            try:
-                r = int(cell.get("row"))
-                c = int(cell.get("col"))
-            except (TypeError, ValueError):
-                continue
-            ref = str(cell.get("ref") or "")
-            if not (0 <= r < rows and 0 <= c < cols):
-                continue
-            if ref not in valid_text_ids:
-                continue
-            cells_out.append({"row": r, "col": c, "ref": ref})
-        if cells_out:
-            tables_out.append(
-                {
-                    "id": str(tbl.get("id") or f"tbl{len(tables_out)}"),
-                    "rows": rows,
-                    "cols": cols,
-                    "cells": cells_out,
-                }
-            )
 
     required_text_ids: list[str] = []
     required_image_ids: list[str] = []
@@ -636,7 +597,11 @@ def _extract_page_state(step2: dict[str, Any], *, images_dir: Path | None = None
         if iid not in required_set:
             required_set.add(iid)
             required_image_ids.append(iid)
-    required_all = list(required_image_ids) + list(required_text_ids)
+    required_table_ids = [str(t.get("id")) for t in tables_out if str(t.get("id") or "")]
+    for tid in required_table_ids:
+        if tid not in required_set:
+            required_set.add(tid)
+    required_all = list(required_image_ids) + list(required_text_ids) + required_table_ids
 
     primary = palette.get("primary") if isinstance(palette, dict) else None
     if not isinstance(primary, str):
@@ -1020,39 +985,19 @@ def _check_positioning(*, page_block: str) -> list[str]:
             "(must also set `inset:0`)"
         )
 
-    # Positional offsets are banned everywhere. The negative lookbehind for "-"
-    # keeps `border-top` / `padding-left` / `border-bottom` allowed.
-    if re.search(r"(?<!-)\btop\s*:", page_block, flags=re.I) or re.search(r"(?<!-)\bleft\s*:", page_block, flags=re.I):
+    # Positional offsets are banned in actual CSS declarations. Inspect only
+    # rule bodies and inline style values so prose and HTML comments such as
+    # "LEFT: ..." cannot be mistaken for CSS.
+    css_segments = _iter_style_decl_segments(page_block)
+    css_text = ";".join(css_segments)
+    declaration = r"(?:^|;)\s*(?:top|left)\s*:"
+    if re.search(declaration, css_text, flags=re.I):
         hard.append("forbidden_css: top/left (positional offsets are not allowed; use inset:0 for SVG fill)")
-    if re.search(r"(?<!-)\bright\s*:", page_block, flags=re.I) or re.search(r"(?<!-)\bbottom\s*:", page_block, flags=re.I):
+    declaration = r"(?:^|;)\s*(?:right|bottom)\s*:"
+    if re.search(declaration, css_text, flags=re.I):
         hard.append("forbidden_css: right/bottom (positional offsets are not allowed; use inset:0 for SVG fill)")
 
     return hard
-
-
-_TABLE_RE = re.compile(r"(?is)<table\b[^>]*>.*?</table>")
-_CELL_RE = re.compile(r"(?is)<(?:td|th)\b[^>]*\bdata-ref\s*=\s*\"([^\"]+)\"[^>]*>")
-
-
-def _is_table_column_ref(page_block: str, ref: str) -> bool:
-    """A repeated `data-ref` is legal ONLY when it marks one column of a single
-    <table>: every one of its occurrences sits on a <td>/<th> cell, and all of
-    those cells belong to the SAME <table>. This is how two text nodes are
-    aligned row-by-row inside one table (each column = one data-ref, repeated
-    once per row). Returns True when `ref` satisfies that; False otherwise
-    (cross-table repetition, occurrences on non-cell elements, or a mix)."""
-    total = len(re.findall(r'data-ref\s*=\s*"' + re.escape(ref) + r'"', page_block))
-    if total <= 1:
-        return True
-
-    tables = list(_TABLE_RE.finditer(page_block))
-    for tbl in tables:
-        cell_refs = _CELL_RE.findall(tbl.group(0))
-        in_this_table = sum(1 for r in cell_refs if r == ref)
-        # All occurrences of `ref` must be cells of THIS one table.
-        if in_this_table == total:
-            return True
-    return False
 
 
 def _validate_and_normalize_page_block(
@@ -1092,6 +1037,25 @@ def _validate_and_normalize_page_block(
         declared_tables = page_state.get("tables") if isinstance(page_state.get("tables"), list) else []
         if not declared_tables and re.search(r"(?is)</?(?:table|tr|td|th)\b", t):
             hard.append("undeclared_table: page_state.tables is empty; use normal text containers, not table markup")
+        # Native table contract: the table id is the only data-ref and every
+        # visible cell keeps its own data-cell-id. Covered merge placeholders
+        # are intentionally absent from HTML.
+        for expected in declared_tables:
+            if not isinstance(expected, dict):
+                continue
+            table_id = str(expected.get("id") or "")
+            match = re.search(r"(?is)<table\b[^>]*\bdata-ref\s*=\s*[\"']" + re.escape(table_id) + r"[\"'][^>]*>(.*?)</table>", t)
+            if not match:
+                hard.append(f"missing_table: {table_id}")
+                continue
+            body = match.group(1)
+            if not re.search(r"(?is)<colgroup\b", body):
+                hard.append(f"missing_table_colgroup: {table_id}")
+            expected_cells = {str(cell.get("id")) for row in (expected.get("data") or []) for cell in (row if isinstance(row, list) else []) if isinstance(cell, dict) and (cell.get("text") or int(cell.get("rowspan", 1) or 1) > 1 or int(cell.get("colspan", 1) or 1) > 1)}
+            actual_cells = set(re.findall(r"(?is)\bdata-cell-id\s*=\s*[\"']([^\"']+)", body))
+            missing_cells = sorted(expected_cells - actual_cells)
+            if missing_cells:
+                hard.append(f"missing_table_cells[{table_id}]: {missing_cells[:20]}")
 
         data_refs = re.findall(r'data-ref\s*=\s*"([^"]+)"', t)
         counts = Counter([r for r in data_refs if isinstance(r, str)])
@@ -1105,13 +1069,9 @@ def _validate_and_normalize_page_block(
             hard.append(f"unknown_data_ref: {unknown[:50]}{' ...' if len(unknown) > 50 else ''}")
 
         dup_candidates = [r for r, c in counts.items() if r and c > 1]
-        # A data-ref may legitimately repeat ONLY when it labels one COLUMN of a
-        # single <table>: every occurrence sits on a <td>/<th> cell inside the same
-        # <table>. That is how we align two text nodes row-by-row (Chinese column
-        # data-ref="t2", English column data-ref="t3") via native <tr> rows. Any
-        # other repetition (across two tables, or on non-cell elements, or a mix) is
-        # still a hard error.
-        dup = sorted([r for r in dup_candidates if not _is_table_column_ref(t, r)])
+        # Every editable reference is singular. Native table cells use their own
+        # data-cell-id and never repeat a text data-ref.
+        dup = sorted(dup_candidates)
         if dup:
             hard.append(f"duplicate_data_ref: {dup[:50]}{' ...' if len(dup) > 50 else ''}")
 

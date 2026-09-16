@@ -10,7 +10,10 @@ edit/ingest tools import a common core without a circular dependency.
 
 from __future__ import annotations
 
+import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from langchain.tools import ToolRuntime
@@ -59,46 +62,76 @@ def emit(project_id: str, event: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-project serialization. A pipeline turn mutates shared per-project disk
-# state and uses next_turn_dir() with mkdir(exist_ok=False); concurrent turns
-# for the same project would race. Guard with a threading.Lock because tools
-# may execute off the event loop.
+# Page-scoped execution. Expensive work may run concurrently for independent
+# slots, while a single slot remains serialized from read through commit.
 # ---------------------------------------------------------------------------
 
-_project_locks: dict[str, threading.Lock] = {}
+_page_locks: dict[tuple[str, int], threading.RLock] = {}
+_page_order_locks: dict[str, threading.Lock] = {}
+_initialization_locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
+try:
+    MAX_CONCURRENT_PAGE_JOBS = max(1, int(os.environ.get("PPT_MAX_CONCURRENT_PAGE_JOBS", "5")))
+except ValueError:
+    MAX_CONCURRENT_PAGE_JOBS = 5
+_page_job_slots = threading.BoundedSemaphore(MAX_CONCURRENT_PAGE_JOBS)
 
 
-def project_lock(project_id: str) -> threading.Lock:
+def page_lock(project_id: str, slot: int) -> threading.RLock:
+    key = (str(project_id), int(slot))
     with _locks_guard:
-        lock = _project_locks.get(project_id)
+        lock = _page_locks.get(key)
         if lock is None:
-            lock = threading.Lock()
-            _project_locks[project_id] = lock
+            lock = threading.RLock()
+            _page_locks[key] = lock
         return lock
 
 
-# ---------------------------------------------------------------------------
-# Preview index rebuild lock. `preview/index.html` is rebuilt from ALL of a
-# deck's chunk_*.html files (step3 + step4). When several pages of one batch run
-# in PARALLEL, each rebuild does read-all-chunks -> render -> atomic write; two
-# overlapping rebuilds can lose an update (A reads, B writes, A writes its stale
-# copy). Per-page files never collide (different folders), so this is the only
-# extra guard parallel editing needs. Keyed per project; held only for the
-# in-memory rebuild, so it never blocks the expensive LLM/render work.
-# ---------------------------------------------------------------------------
-
-_index_locks: dict[str, threading.Lock] = {}
-_index_locks_guard = threading.Lock()
-
-
-def index_rebuild_lock(project_id: str) -> threading.Lock:
-    with _index_locks_guard:
-        lock = _index_locks.get(project_id)
+def page_order_lock(project_id: str) -> threading.Lock:
+    with _locks_guard:
+        lock = _page_order_locks.get(str(project_id))
         if lock is None:
             lock = threading.Lock()
-            _index_locks[project_id] = lock
+            _page_order_locks[str(project_id)] = lock
         return lock
+
+
+def project_initialization_lock(project_id: str) -> threading.Lock:
+    with _locks_guard:
+        lock = _initialization_locks.get(str(project_id))
+        if lock is None:
+            lock = threading.Lock()
+            _initialization_locks[str(project_id)] = lock
+        return lock
+
+
+@contextmanager
+def page_job(project_id: str, slot: int):
+    """Guard one page's complete read/compute/commit lifecycle."""
+    with page_lock(project_id, int(slot)):
+        with _page_job_slots:
+            yield
+
+
+def execute_page_jobs(project_id: str, jobs: list[tuple[int, Any]], worker: Callable[[int], Any]) -> dict[int, Any]:
+    """Run independent page jobs with the shared process-wide worker budget."""
+    if not jobs:
+        return {}
+    max_workers = min(MAX_CONCURRENT_PAGE_JOBS, len(jobs))
+    if max_workers <= 1:
+        return {index: worker(index) for index, _slot in jobs}
+    results: dict[int, Any] = {}
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"page-{str(project_id)[:12]}") as pool:
+        futures = {pool.submit(worker, index): index for index, _slot in jobs}
+        for future in as_completed(futures):
+            index = futures[future]
+            results[index] = future.result()
+    return results
+
+
+def assert_unique_page_jobs(slots: list[int]) -> None:
+    if len(set(int(slot) for slot in slots)) != len(slots):
+        raise ValueError("duplicate_page_target")
 
 
 def reread_if_needed(*, pid: str, page: int, slot: int, model: str, paths) -> bool:
@@ -322,15 +355,16 @@ def sync_deck_page_count(project_id: str) -> None:
 
     try:
         paths = workspace_for(project_id)
-        n = int(_pc(paths))
-        mf = paths.project_manifest_json()
-        if not mf.exists():
-            return
-        obj = read_json(mf)
-        if not isinstance(obj, dict):
-            return
-        obj["page_count"] = n
-        _wj(mf, obj)
+        with page_order_lock(project_id):
+            n = int(_pc(paths))
+            mf = paths.project_manifest_json()
+            if not mf.exists():
+                return
+            obj = read_json(mf)
+            if not isinstance(obj, dict):
+                return
+            obj["page_count"] = n
+            _wj(mf, obj)
         uid = obj.get("user_id")
         if uid:
             from agent_backend.workspace.repo import upsert_deck
@@ -418,8 +452,12 @@ __all__ = [
     "AgentContext",
     "set_progress_publisher",
     "emit",
-    "project_lock",
-    "index_rebuild_lock",
+    "page_lock",
+    "page_order_lock",
+    "project_initialization_lock",
+    "page_job",
+    "execute_page_jobs",
+    "assert_unique_page_jobs",
     "reread_if_needed",
     "require_session_id",
     "require_user_id",

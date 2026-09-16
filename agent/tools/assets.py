@@ -1,4 +1,4 @@
-"""Tool: stage_page_asset — bind a chat Artifact image to a target page.
+"""Tools for staging Session Resources into a target page.
 
 The user uploads images through the Artifact API before a chat run starts. Once
 the agent knows WHICH page the picture belongs to, this tool copies or hardlinks
@@ -23,7 +23,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
 from agent_backend.agent.tools.context import (
-    project_lock,
+    page_lock,
     require_agent_run_id,
     require_project_id,
     require_session_id,
@@ -33,6 +33,7 @@ from agent_backend.agent.tools.context import (
 from agent_backend.workspace import repo
 from agent_backend.workspace import pageorder
 from agent_backend.workspace.paths import read_json, write_json
+from agent_backend.workspace.session_resources import resource_path
 
 
 def _uniquify(dst_dir: Path, name: str) -> str:
@@ -63,6 +64,27 @@ def _append_pending(paths, slot: int, entry: dict[str, str]) -> None:
     write_json(p, {"schema_version": "pending_uploads_v1", "uploads": existing})
 
 
+def _message_context(runtime: ToolRuntime, session_id: str, user_id: str) -> tuple[str | None, int | None]:
+    context = runtime.context or {}
+    message_id = context.get("current_message_id") if isinstance(context, dict) else getattr(context, "current_message_id", None)
+    message_id = str(message_id or "") or None
+    return message_id, repo.get_message_seq(message_id=message_id or "", session_id=session_id, user_id=user_id)
+
+
+def _append_pending_resource(paths, slot: int, entry: dict[str, Any]) -> None:
+    p = paths.pending_resources_json(slot)
+    existing: list[dict[str, Any]] = []
+    if p.exists():
+        try:
+            data = read_json(p)
+            if isinstance(data, dict) and isinstance(data.get("resources"), list):
+                existing = [it for it in data["resources"] if isinstance(it, dict)]
+        except Exception:
+            pass
+    existing.append(entry)
+    write_json(p, {"schema_version": "pending_resources_v1", "resources": existing})
+
+
 def _copy_or_link(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
@@ -74,69 +96,86 @@ def _copy_or_link(src: Path, dst: Path) -> None:
 
 
 @tool
-def stage_page_asset(
+def stage_page_resource(
     page_ref: str,
-    artifact_ref: str,
+    resource_ref: str,
     runtime: ToolRuntime,
     user_note: str = "",
 ) -> dict[str, Any]:
-    """Place a chat-uploaded image onto a page, ready for image.add/replace.
+    """Stage an immutable Session Resource for a later operation on one page.
 
-    Call this BEFORE editing a page when the user attached an image they want on
-    that page. `page_ref` is the stable page ref returned by outline/locate.
-    `artifact_ref` is one of the current message's uploaded Artifact refs.
+    `page_ref` is the stable page ref returned by outline/locate.
+    `resource_ref` identifies a resource in the current session.
     `user_note` is the user's own words about the image.
 
-    This copies/links the file into the page's asset bundle and records it as pending.
-    Follow up on the SAME page: use `patch_pages(images_involved=True)` for an
-    in-place replacement, `fill_empty_pages` for a blank page, or `edit_pages`
-    when a nonblank page's composition must change.
+    This copies/links the file into the page's asset bundle and records it as
+    pending for a subsequent page operation in the same run.
     """
     pid = require_project_id(runtime)
     sid = require_session_id(runtime)
     uid = require_user_id(runtime)
     run_id = require_agent_run_id(runtime)
+    message_id, message_seq = _message_context(runtime, sid, uid)
     paths = workspace_for(pid)
-    lock = project_lock(pid)
-
-    ref = str(artifact_ref or "").strip()
+    ref = str(resource_ref or "").strip()
     if not ref:
-        return {"project_id": pid, "ok": False, "error": "artifact_ref is required"}
-    artifact = repo.get_artifact(artifact_ref=ref, session_id=sid, user_id=uid)
-    if not artifact or artifact.get("status") == "deleted":
-        return {"project_id": pid, "ok": False, "error": "artifact_not_found"}
-    src = Path(str(artifact.get("storage_path") or ""))
-    if not src.is_file():
-        return {"project_id": pid, "ok": False, "error": "artifact_file_missing"}
+        return {"project_id": pid, "ok": False, "error": "resource_ref is required"}
+    resource = repo.get_session_resource(resource_ref=ref, session_id=sid, user_id=uid)
+    if not resource or resource.get("status") == "deleted":
+        return {"project_id": pid, "ok": False, "error": "resource_not_found"}
 
-    with lock:
-        slot = pageorder.slot_for_page_ref(paths, str(page_ref))
-        if slot is None:
+    slot = pageorder.slot_for_page_ref(paths, str(page_ref))
+    if slot is None:
+        return {"project_id": pid, "ok": False, "error": "page_not_found"}
+    with page_lock(pid, int(slot)):
+        if pageorder.entry_for_slot(paths, int(slot)) is None:
             return {"project_id": pid, "ok": False, "error": "page_not_found"}
         page = pageorder.position_for_slot(paths, int(slot))
 
-        sha = str(artifact.get("sha256") or "")
-        suffix = Path(str(artifact.get("filename") or src.name)).suffix or src.suffix or ".png"
-        fname = f"{sha[:16] or ref}{suffix}"
-        rel_name = f"{run_id}/{fname}"
         dst_dir = paths.page_assets_dir(int(slot)) / "uploads" / run_id
         dst_dir.mkdir(parents=True, exist_ok=True)
+        staged: list[str] = []
         try:
-            _copy_or_link(src, dst_dir / fname)
+            for item in resource.get("files") or []:
+                role = str(item.get("role") or "original")
+                source = resource_path(uid, sid, ref, str(item.get("relative_path") or ""))
+                if not source.is_file():
+                    continue
+                fname = f"{ref}_{role}{source.suffix or '.bin'}"
+                _copy_or_link(source, dst_dir / fname)
+                staged.append(fname)
         except OSError as e:
             return {"project_id": pid, "ok": False, "error": f"stage failed: {e}"}
+        if not staged:
+            return {"project_id": pid, "ok": False, "error": "resource_file_missing"}
 
-        _append_pending(
-            paths,
-            int(slot),
-            {
-                "filename": rel_name,
+        original = next((f for f in resource.get("files") or [] if f.get("role") == "original"), None)
+        original_stage = next((name for name in staged if name.startswith(f"{ref}_original")), None)
+        if original and original_stage:
+            original_name = Path(str(original.get("relative_path") or original_stage)).name
+            _append_pending(paths, int(slot), {
+                "filename": f"{run_id}/{original_stage}",
                 "user_note": str(user_note or "").strip(),
+                "resource_ref": ref,
                 "artifact_ref": ref,
                 "run_id": run_id,
-                "original_filename": str(artifact.get("filename") or ""),
+                "original_filename": original_name,
+                "resource_kind": resource.get("kind"),
                 "status": "pending",
-            },
+            })
+        else:
+            _append_pending_resource(paths, int(slot), {
+                "resource_ref": ref,
+                "run_id": run_id,
+                "user_note": str(user_note or "").strip(),
+                "resource_kind": resource.get("kind"),
+                "files": [f"{run_id}/{name}" for name in staged],
+                "status": "pending",
+            })
+        repo.touch_session_resources(
+            resource_refs=[ref], session_id=sid, user_id=uid,
+            relation="staged", agent_run_id=run_id, message_id=message_id, message_seq=message_seq,
+            details={"target_project_id": pid, "target_page_ref": pageorder.page_ref_for_slot(int(slot)), "user_note": str(user_note or "").strip()},
         )
 
     return {
@@ -144,9 +183,13 @@ def stage_page_asset(
         "ok": True,
         "page": int(page or 0),
         "page_ref": pageorder.page_ref_for_slot(int(slot)),
+        "resource_ref": ref,
         "artifact_ref": ref,
-        "filename": rel_name,
+        "filename": f"{run_id}/{original_stage}" if original_stage else None,
+        "kind": resource.get("kind"),
     }
 
 
-__all__ = ["stage_page_asset"]
+stage_page_asset = stage_page_resource
+
+__all__ = ["stage_page_resource", "stage_page_asset"]

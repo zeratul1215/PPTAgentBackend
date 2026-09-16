@@ -50,13 +50,17 @@ def _load_step_modules():
 # ---------------------------------------------------------------------------
 
 
-def run_step1(*, understand_input: dict[str, Any], model: str, dry_run: bool) -> dict[str, Any]:
+def run_step1(
+    *, understand_input: dict[str, Any], model: str, dry_run: bool,
+    focus_requests: list[str] | None = None,
+) -> dict[str, Any]:
     s1, *_ = _load_step_modules()
     return s1.understand_step(
         input_obj=understand_input,
         api_key=None,
         model=model,
         dry_run=dry_run,
+        focus_requests=focus_requests,
     )
 
 
@@ -70,6 +74,7 @@ def run_step2(
     user_request: str,
     understand_output: dict[str, Any],
     selected_refs: list[str] | None = None,
+    previous_html_available: bool = False,
     model: str,
     dry_run: bool,
 ) -> dict[str, Any]:
@@ -78,51 +83,14 @@ def run_step2(
         "user_request": str(user_request or ""),
         "selected_refs": list(selected_refs or []),
         "understand_output": understand_output,
+        "previous_html_available": bool(previous_html_available),
     }
     return s2.step2_run(
         request_obj=request_obj,
         api_key=None,
         model=model,
         dry_run=dry_run,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Step 2.5 (beautify reference image) — only when the resolved visual_intent
-# is enabled. Produces a high-fidelity reference image that step3 replicates.
-# ---------------------------------------------------------------------------
-
-
-def step2_has_layout_intent(step2_output: dict[str, Any]) -> bool:
-    _, _, s3, _ = _load_step_modules()
-    return bool(s3._has_layout_intent(step2_output))
-
-
-def run_beautify_reference_image(
-    *,
-    step2_output: dict[str, Any],
-    out_path: Path,
-    original_understanding: dict[str, Any] | None = None,
-    deck_style: dict[str, Any] | None = None,
-    creation_mode: bool = False,
-    force_generation: bool = False,
-) -> dict[str, Any]:
-    """Generate the beautify reference image for one page.
-
-    Raises RuntimeError on backend/config/API failure; the caller (graph node)
-    is responsible for degrading gracefully (step3 falls back to the original
-    page render when no reference image is available).
-    """
-    img_mod = importlib.import_module(
-        "agent_backend.agent.tools.heavy_tool_impl.single_page_edition.step_2_plan.image_reference_gen"
-    )
-    return img_mod.generate_beautify_reference_image(
-        step2_output=step2_output,
-        out_path=Path(out_path),
-        original_understanding=original_understanding,
-        deck_style=deck_style,
-        creation_mode=bool(creation_mode),
-        force_generation=bool(force_generation),
+        previous_html_available=bool(previous_html_available),
     )
 
 
@@ -279,11 +247,17 @@ def run_step3_single_page(
     _reassemble_runtime_index_html(bundle_dir=bundle_dir, title=title)
 
     visual_self_check: dict[str, Any]
-    enabled = str(os.environ.get("PPT_STEP3_VISUAL_SELF_CHECK", "1")).strip().lower() not in {
-        "0", "false", "no", "off"
+    enabled = str(os.environ.get("PPT_STEP3_VISUAL_SELF_CHECK", "0")).strip().lower() in {
+        "1", "true", "yes", "on"
     }
     if not enabled:
-        visual_self_check = {"status": "disabled", "severity": "none", "repair_applied": False}
+        visual_self_check = {
+            "status": "skipped",
+            "reason": "disabled_by_config",
+            "verdict": "not_run",
+            "severity": "none",
+            "repair_applied": False,
+        }
     elif not used_beautify_reference or not ref_s or not Path(ref_s).exists():
         visual_self_check = {
             "status": "skipped",
@@ -326,6 +300,14 @@ def run_step3_single_page(
             "severity": "none",
             "repair_applied": False,
         }
+        if visual_self_check.get("status") in {"unavailable", "error"}:
+            raise RuntimeError("step3 visual self-check unavailable")
+        if (
+            visual_self_check.get("verdict") == "revise"
+            and visual_self_check.get("severity") == "major"
+            and not visual_self_check.get("repair_applied")
+        ):
+            raise RuntimeError("step3 visual self-check found an unrepaired major issue")
         repaired_block = str(check.get("page_block") or page_block)
         if repaired_block and repaired_block != page_block:
             final_html = _build_chunk_html(page_block=repaired_block, base_href=base_href, title=title, s3_mod=s3)

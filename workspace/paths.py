@@ -21,6 +21,7 @@ from typing import Any
 # This keeps the subproject runnable when vendored or split into its own repo.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "result"
+DEFAULT_SESSION_RESOURCES_ROOT = PROJECT_ROOT / "session_resources"
 
 
 def _safe_project_id(stem: str) -> str:
@@ -84,19 +85,13 @@ class WorkspacePaths:
 
     @property
     def session_uploads_dir(self) -> Path:
-        """Landing zone for chat-dropped attachments (images) BEFORE the agent
-        has decided which page they belong to.
-
-        ``/chat`` writes each raw attachment here and injects an "available
-        uploads" manifest into the agent context. When the agent knows the
-        target page it calls the ``stage_page_asset`` tool, which MOVES the file
-        from here into that page's stable ``page_assets_dir`` and records it in
-        the page's pending-uploads manifest for ``image.add`` to consume."""
+        """Legacy project-local landing path; new chat resources use the
+        centralized Session Resource directory instead."""
         return self.root / "_session_uploads"
 
     def pending_uploads_json(self, page_num: int) -> Path:
         """Per-page manifest of user uploads staged for this page but not yet
-        consumed. ``stage_page_asset`` appends ``{filename, user_note}`` entries;
+        consumed. ``stage_page_resource`` appends ``{filename, user_note}`` entries;
         the ``image.add`` skill reads them, adds each to ``state["images"]``, and
         clears the manifest so a later turn doesn't re-add them.
 
@@ -105,6 +100,10 @@ class WorkspacePaths:
         cloned state, never ``WorkspacePaths``. The leading underscore keeps it
         out of the way of the ``upload_*`` / ``reread_img_*`` image files."""
         return self.page_assets_dir(page_num) / "uploads" / "_pending_uploads.json"
+
+    def pending_resources_json(self, page_num: int) -> Path:
+        """Run-scoped manifest for staged non-image Session Resources."""
+        return self.page_assets_dir(page_num) / "uploads" / "_pending_resources.json"
 
     def page_understanding_json(self, page_num: int) -> Path:
         """Shared page understanding wrapper.
@@ -127,9 +126,6 @@ class WorkspacePaths:
         """
         safe = re.sub(r"[^A-Fa-f0-9_.-]+", "_", str(content_hash))[:128] or "unknown"
         return self.page_state_dir(page_num) / "staged" / f"pptist_slide_{safe}.json"
-
-    def beautify_reference_png(self, page_num: int) -> Path:
-        return self.page_state_dir(page_num) / "beautify_reference.png"
 
     def page_pending_reread_marker(self, page_num: int) -> Path:
         """Per-page JSON sidecar describing why ``current_page_state`` is stale.
@@ -165,6 +161,20 @@ class WorkspacePaths:
 
     def project_manifest_json(self) -> Path:
         return self.root / "project.json"
+
+
+def session_resources_root() -> Path:
+    """Return the central, per-session resource store root."""
+    configured = (os.getenv("PPT_SESSION_RESOURCES_ROOT") or "").strip()
+    return Path(configured).expanduser().resolve() if configured else DEFAULT_SESSION_RESOURCES_ROOT
+
+
+def session_resource_dir(user_id: str, session_id: str, resource_ref: str) -> Path:
+    """Build a safe resource directory path from opaque identifiers."""
+    for value in (user_id, session_id, resource_ref):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(value or "")):
+            raise ValueError("invalid session resource identifier")
+    return session_resources_root() / str(user_id) / str(session_id) / str(resource_ref)
 
 
 def workspace_for(project_id: str, *, results_root: Path | None = None) -> WorkspacePaths:

@@ -8,9 +8,8 @@ its own module (`text_translate.py`, ...) and depends ONLY on this base.
 
 The plan/compile stage no longer hard-codes a closed set of capability types.
 Every content-editing capability is a self-describing `Skill`: it carries the
-doc the planner needs to fill its params, a `repair` pass that plugs missing
-params with safe defaults, a local `ordering_note` (a per-skill sequencing
-suggestion shown to the planner) plus an optional `hard_before` set for the rare
+capability contract the planner needs, a `repair` pass that plugs missing params
+with safe defaults, a soft `ordering_note`, an optional `hard_before` set for rare
 safety-critical ordering edges, and an `execute` that mutates the cloned page
 state. Adding a capability = registering one more `Skill` (see
 `skills/__init__.py`).
@@ -33,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import httpx
+from .....table_spec import iter_cell_refs
 
 
 @dataclass
@@ -57,6 +57,9 @@ class SkillResult:
     """What a skill's `execute` reports back to the compiler."""
 
     warnings: list[str] = field(default_factory=list)
+    # Explicit fail-closed outcome used by the compiler. Every successful
+    # executor must opt into applied or already_satisfied.
+    status: str = "failed"
     # True when this skill changed the page's element set or element geometry
     # enough that the layout should be visually re-flowed downstream.
     triggered_visual: bool = False
@@ -77,13 +80,10 @@ class Skill:
     defaults in place and returns a list of repair notes. `execute` mutates
     `state` (the cloned understand_output) and returns a `SkillResult`.
 
-    Ordering is expressed LOCALLY, not by a global total order:
-    - `ordering_note` is a short natural-language hint (spliced into the planner
-      prompt) describing when this skill usually runs relative to others and WHY.
-      It is a SUGGESTION the planner weighs against the user's stated intent; the
-      user's explicit ordering always wins. Adding a skill = writing its own note,
-      never re-deriving a global sequence.
-    - `hard_before` is the rare exception: a set of skill ids that MUST run AFTER
+    Ordering is inferred by the planner from the current request and explicit
+    skill capabilities. `ordering_note` provides a usual sequencing preference,
+    but never overrides the user's stated order or a dependency in the current
+    task. `hard_before` is the rare exception: a set of skill ids that MUST run AFTER
       this one for CORRECTNESS/SAFETY reasons (e.g. redact before any skill that
       re-emits content, so sensitive spans are removed before they propagate).
       These few edges are enforced in code regardless of the planner. Keep this
@@ -99,17 +99,12 @@ class Skill:
     plan_doc: str
     repair: Callable[[dict[str, Any]], list[str]]
     execute: Callable[..., SkillResult]
-    # Free-text ordering suggestion shown to the planner (empty = no preference).
+    # Soft sequencing guidance shown to the planner, never a scenario recipe.
     ordering_note: str = ""
     # Skill ids that MUST run after this one for safety/correctness (rare).
     hard_before: frozenset[str] = frozenset()
-    # Coarse execution phase used to enforce a code-level global order at compile
-    # time (Scheme A): every "text" skill runs to completion before any "table"
-    # skill, so table skills always see the FINAL text nodes (translations,
-    # rewrites) and stable ids. Within a phase, ordering is still decided by the
-    # planner's `after` edges + the few `hard_before` safety edges. Phases:
-    #   "text"  — edits the actual text of nodes (redact/rewrite/translate).
-    #   "table" — organizes/reshapes/derives table structure over final text.
+    # Coarse capability category retained for timing/audit metadata. It does not
+    # create execution dependencies; the planner's `after` edges own ordering.
     phase: str = "text"
 
 
@@ -128,7 +123,7 @@ def _hard_ordering_edges() -> list[tuple[str, str]]:
 
     Returns edges as (A, B) meaning: a B-intent must run AFTER an A-intent when
     both are present. This is the only cross-skill ordering enforced in code;
-    everything else is left to the planner (guided by `ordering_note`).
+    everything else is inferred by the planner from the current request.
     """
     edges: list[tuple[str, str]] = []
     for skill in SKILLS.values():
@@ -138,18 +133,13 @@ def _hard_ordering_edges() -> list[tuple[str, str]]:
 
 
 def _build_skill_docs() -> str:
-    """Concatenate every registered skill's planner doc (order = registration).
-
-    Each skill's own `ordering_note` (if any) is appended as a SUGGESTION so the
-    planner reasons about sequencing per-skill, weighing it against the user's
-    stated intent, rather than following a hard-coded global order.
-    """
+    """Expose capability contracts and soft ordering guidance, without recipes."""
     parts: list[str] = []
     for skill in SKILLS.values():
         block = f"* skill id = \"{skill.id}\" — {skill.summary}\n{skill.plan_doc.strip()}"
         note = (skill.ordering_note or "").strip()
         if note:
-            block += f"\n  ordering suggestion: {note}"
+            block += f"\n  usual ordering (soft guidance): {note}"
         parts.append(block)
     return "\n\n".join(parts)
 
@@ -328,100 +318,6 @@ def _call_claude_json(
         if attempt < int(retries):
             time.sleep(min(30.0, 2.0 * (2.0 ** attempt)))
     return "", None, f"model_call_failed: {last_err}"
-def _parse_segment_range(spec: str, seg_count: int) -> list[int]:
-    """Parse the segment-selector part of an "id#<spec>" scope entry.
-
-    `spec` supports comma-separated ranges/indices, all 0-based and inclusive:
-      "0-4"      -> [0,1,2,3,4]
-      "0,2,5"    -> [0,2,5]
-      "2-"       -> [2 .. seg_count-1]
-      "3"        -> [3]
-    Indices are clamped to [0, seg_count); out-of-range / malformed pieces are
-    dropped. Returns a sorted, de-duplicated list of valid indices.
-    """
-    if seg_count <= 0:
-        return []
-    picked: set[int] = set()
-    for piece in spec.split(","):
-        piece = piece.strip()
-        if not piece:
-            continue
-        if "-" in piece:
-            lo_s, hi_s = piece.split("-", 1)
-            lo_s, hi_s = lo_s.strip(), hi_s.strip()
-            try:
-                lo = int(lo_s) if lo_s else 0
-                hi = int(hi_s) if hi_s else seg_count - 1
-            except ValueError:
-                continue
-            if lo < 0:
-                lo = 0
-            if hi > seg_count - 1:
-                hi = seg_count - 1
-            for i in range(lo, hi + 1):
-                picked.add(i)
-        else:
-            try:
-                i = int(piece)
-            except ValueError:
-                continue
-            if 0 <= i < seg_count:
-                picked.add(i)
-    return sorted(picked)
-
-
-def _resolve_scope_selection(
-    scope: Any,
-    by_id: dict[str, dict[str, Any]],
-) -> tuple[list[str], dict[str, list[int]], list[str]]:
-    """Resolve a scope value into (ordered text ids, per-id segment selection).
-
-    Each scope entry is either a bare id ("t2") meaning the WHOLE node, or an
-    "id#<spec>" entry (e.g. "t2#0-4") selecting specific 0-based segments.
-    A bare id (or "page") maps to ALL of the node's segment indices.
-
-    Returns:
-      - ids: ordered list of in-scope text ids (deduplicated, order preserved)
-      - selection: tid -> sorted list of selected segment indices
-      - warnings: notes about dropped/clamped selectors
-    """
-    warnings: list[str] = []
-    ids: list[str] = []
-    selection: dict[str, list[int]] = {}
-
-    def _seg_count(tid: str) -> int:
-        node = by_id.get(tid)
-        if not isinstance(node, dict):
-            return 0
-        return len(_get_segments(node))
-
-    if scope == "page":
-        entries = [tid for tid in by_id.keys()]
-    elif isinstance(scope, list):
-        entries = [s for s in scope if isinstance(s, str)]
-    else:
-        entries = []
-
-    for entry in entries:
-        tid, _, spec = entry.partition("#")
-        tid = tid.strip()
-        if tid not in by_id:
-            continue
-        count = _seg_count(tid)
-        if spec.strip():
-            idxs = _parse_segment_range(spec.strip(), count)
-            if not idxs:
-                warnings.append(f"scope_segment_selector_empty_after_clamp: {entry}")
-                continue
-        else:
-            idxs = list(range(count))
-        if tid in selection:
-            merged = sorted(set(selection[tid]) | set(idxs))
-            selection[tid] = merged
-        else:
-            ids.append(tid)
-            selection[tid] = idxs
-    return ids, selection, warnings
 
 
 def _get_segments(node: dict[str, Any]) -> list[str]:
@@ -434,6 +330,9 @@ def _get_segments(node: dict[str, Any]) -> list[str]:
 
 def _set_segments(node: dict[str, Any], segments: list[str]) -> None:
     segs = [str(x) for x in segments if isinstance(x, str)]
+    table_cell = node.get("_table_cell_ref")
+    if isinstance(table_cell, dict):
+        table_cell["text"] = "".join(segs)
     node["segments"] = segs
     node["text"] = "".join(segs)
 
@@ -474,13 +373,18 @@ def _flatten_to_segment_items(
             seg_text = segs[idx]
             seg_id = f"{tid}::seg{idx}"
             seg_map[seg_id] = (tid, idx)
-            items.append(
-                {
-                    "id": seg_id,
-                    "kind": str(node.get("kind") or ""),
-                    "text": str(seg_text or ""),
-                }
-            )
+            item = {
+                "id": seg_id,
+                "kind": str(node.get("kind") or ""),
+                "text": str(seg_text or ""),
+            }
+            if item["kind"] == "table_cell":
+                item["table_id"] = str(node.get("table_id") or "")
+                item["row"] = node.get("row")
+                item["col"] = node.get("col")
+                item["rowspan"] = node.get("rowspan")
+                item["colspan"] = node.get("colspan")
+            items.append(item)
     return items, seg_map, seg_counts
 
 
@@ -514,6 +418,9 @@ How to map a natural-language target to items:
   item's `text` and pick the ones that match.
 - Ordinal words ("前五条/第2到第4条/最后一条") → pick items by their order
   (items are given in natural reading order, top-to-bottom).
+- Table-cell items also carry `table_id`, one-based `row`/`col`, and spans. Use
+  these only to resolve the user's visible table reference; never treat a
+  neighboring cell as in scope merely because it shares a row or column.
 
 Rules:
 - Do NOT widen a specific target to the whole page. If the objective clearly
@@ -521,6 +428,39 @@ Rules:
 - If you genuinely cannot tell which items match, return an empty result rather
   than guessing wrong.
 - NEVER invent item ids. Only use the `id` values given to you."""
+
+
+def _text_targets(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return real text nodes plus lightweight aliases for visible table cells.
+
+    Table cells are not copied into ``state['texts']``.  The aliases exist only
+    for objective-driven text skills and carry a private pointer so writes go
+    straight back to ``tables[].data[][]``.
+    """
+    out = [t for t in (state.get("texts") or []) if isinstance(t, dict)]
+    seen_ids = {str(t.get("id") or "") for t in out if str(t.get("id") or "")}
+    for table in state.get("tables") or []:
+        if not isinstance(table, dict):
+            continue
+        for row_index, col_index, cell in iter_cell_refs(table, include_placeholders=False):
+            alias = {
+                "id": str(cell.get("id") or ""),
+                "kind": "table_cell",
+                "text": str(cell.get("text") or ""),
+                "segments": [str(cell.get("text") or "")],
+                "table_id": str(table.get("id") or ""),
+                "row": row_index + 1,
+                "col": col_index + 1,
+                "rowspan": max(1, int(cell.get("rowspan", 1) or 1)),
+                "colspan": max(1, int(cell.get("colspan", 1) or 1)),
+                "_table_cell_ref": cell,
+            }
+            if alias["id"]:
+                if alias["id"] in seen_ids:
+                    raise ValueError(f"duplicate text target id: {alias['id']}")
+                seen_ids.add(alias["id"])
+                out.append(alias)
+    return out
 
 
 def _all_text_ids(by_id: dict[str, dict[str, Any]]) -> list[str]:
@@ -544,11 +484,17 @@ def _append_parallel_translation(
 
     Returns the provisional id of the new fragment.
     """
-    texts = state.get("texts")
+    texts = _text_targets(state)
     if not isinstance(texts, list):
         return ""
     src = next((t for t in texts if isinstance(t, dict) and t.get("id") == source_id), None)
     kind = str(src.get("kind") or "") if isinstance(src, dict) else ""
+    if isinstance(src, dict) and isinstance(src.get("_table_cell_ref"), dict):
+        cell = src["_table_cell_ref"]
+        current = str(cell.get("text") or "")
+        if tgt_text and tgt_text != current and tgt_text not in current:
+            cell["text"] = current + "\n" + tgt_text
+        return str(source_id)
 
     existing_ids = {str(t.get("id") or "") for t in texts if isinstance(t, dict)}
     n = 0
@@ -562,7 +508,7 @@ def _append_parallel_translation(
         if isinstance(tgt_segments, list) and tgt_segments
         else [tgt_text]
     )
-    texts.append(
+    state.setdefault("texts", []).append(
         {
             "id": new_id,
             "kind": kind,
@@ -724,20 +670,6 @@ def _read_pending_uploads(bundle_dir: "os.PathLike[str] | str") -> list[dict[str
     return out
 
 
-def _clear_pending_uploads(bundle_dir: "os.PathLike[str] | str") -> None:
-    """Consume the pending-uploads manifest so a later turn won't re-add the same
-    files. The image bytes stay in the bundle (they're now real state images)."""
-    from pathlib import Path
-
-    b = Path(bundle_dir)
-    for p in (b / _PENDING_UPLOADS_NAME, b.parent / "uploads" / _PENDING_UPLOADS_NAME):
-        try:
-            if p.exists():
-                p.unlink()
-        except OSError:
-            pass
-
-
 def _resolve_pending_upload_file(bundle_dir: "os.PathLike[str] | str", filename: str) -> Path:
     """Return a stable source asset, promoting a staged upload when needed.
 
@@ -773,30 +705,6 @@ def _resolve_pending_upload_file(bundle_dir: "os.PathLike[str] | str", filename:
                     return uploaded
             return stable if stable.exists() else uploaded
     return stable
-
-
-def _delete_bundle_file(bundle_dir: "os.PathLike[str] | str", src: str) -> bool:
-    """Delete one image file (by bare `src` name) from the bundle dir.
-
-    Used by delete/replace. Only same-name, in-bundle files are removed; data:
-    URIs / absolute / remote srcs are ignored. Failures are swallowed (best
-    effort; user accepted the no-rollback risk)."""
-    from pathlib import Path
-
-    s = (src or "").strip()
-    if not s or s.startswith("data:") or "://" in s or s.startswith("/"):
-        return False
-    name = Path(s).name
-    if not name:
-        return False
-    target = Path(bundle_dir) / name
-    try:
-        if target.is_file():
-            target.unlink()
-            return True
-    except OSError:
-        pass
-    return False
 
 
 _IMAGE_MATCH_SYSTEM_PROMPT = """You select which picture(s) a user's instruction refers to, for a slide-editing pipeline.
@@ -918,45 +826,3 @@ def _append_added_text(
     texts.append(node)
     return new_id
 
-
-def _append_derived_text(
-    *,
-    state: dict[str, Any],
-    text: str,
-    kind: str = "body",
-    derived_from: list[str] | None = None,
-    derived_op: str = "",
-) -> str:
-    """Append a NEW text node holding a value DERIVED by deterministic Python
-    (e.g. a column sum computed by `table.compute`), and return its provisional
-    id.
-
-    The value is computed by code, never by the model — the model only picks the
-    operator/columns/target. The node carries `derived_from` (the source text ids
-    that fed the computation) and `derived_op` (the operator name) purely as
-    provenance metadata; downstream renderers treat it like any other text node.
-    A provisional id (`__dv_<n>`) is assigned and later renumbered to a regular
-    `tN` by `_compact_state_text_ids`.
-    """
-    texts = state.get("texts")
-    if not isinstance(texts, list):
-        return ""
-    existing_ids = {str(t.get("id") or "") for t in texts if isinstance(t, dict)}
-    n = 0
-    while True:
-        new_id = f"__dv_{n}"
-        if new_id not in existing_ids:
-            break
-        n += 1
-    node: dict[str, Any] = {
-        "id": new_id,
-        "kind": kind or "body",
-        "segments": [text],
-        "text": text,
-    }
-    if derived_from:
-        node["derived_from"] = [str(x) for x in derived_from if isinstance(x, str)]
-    if derived_op:
-        node["derived_op"] = str(derived_op)
-    texts.append(node)
-    return new_id

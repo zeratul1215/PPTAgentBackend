@@ -1,223 +1,77 @@
-"""Skill: table.build — organize final text nodes into a table grid.
-
-Objective-driven: the planner passes a natural-language `objective` (e.g. "put
-the year / metric / value content into a 3-column table, with the English
-translation as a 4th column"); NO rows/cols/cells params. This executor runs in
-the "table" phase — AFTER every text edit — so it sees the FINAL text nodes
-(rewrites, translations) with stable ids. It makes ONE model call to decide the
-row/col → text-id mapping over those final nodes, then records the grid using the
-schema step1/step3 share: { id, rows, cols, cells:[{row,col,ref}] }.
-
-It does NOT edit any text; it only records structure.
-"""
-
+"""Build one native PPTist table from semantic page content."""
 from __future__ import annotations
-
 import json
 from typing import Any
+from .base import Skill, SkillResult, _call_claude_json
+from .....table_spec import validate_table_spec
 
-from .base import _LOCATE_GUIDE, Skill, SkillResult, _call_claude_json
+_DOC = """Capability: create exactly one new native table from the objective and
+available semantic page content. Sources may include text, shape text, existing
+tables, and image descriptions. It outputs a rectangular matrix; fixed code owns
+IDs, widths, and validation. It can remove source text only through explicit
+consume_source_ids in its result."""
+_PROMPT = """Return JSON only:
+{\"rows\":1,\"cols\":1,\"cells\":[[{\"text\":\"...\",\"source_ids\":[]}]],\"consume_source_ids\":[]}
+Create one rectangular table for objective. Keep user-specified text exact.
+Use source_ids when a cell is derived from supplied items; otherwise write the
+final cell text. Do not create merges."""
 
+def _repair(params): return []
 
-_BUILD_SYSTEM_PROMPT = """You are the "TABLE-BUILD" subagent for a single-page PPT-editing pipeline.
-
-You are given:
-- `user_request`: the user's full original instruction (context only).
-- `objective`: what table to build, in natural language (which content goes into
-  the table and roughly how it should be organized into columns/rows).
-- `items`: EVERY text item on the page. Each has `id`, `kind`, `text`, and (if
-  multi-line) a `segments` array. Translations added earlier carry
-  `translation_of` = the source id they translate.
-
-""" + _LOCATE_GUIDE + """
-
-Then design a table grid over the IN-SCOPE content and output the row/col → id
-mapping.
-
-Grid rules:
-- Decide `rows` and `cols` (both >= 1) from the content and the objective.
-- Emit one `cells` entry per NON-EMPTY cell: {row, col, ref}. `row`/`col` are
-  0-based. Omit empty cells.
-- `ref` MUST be an `id` from `items`. Never invent an id.
-- A column that is ONE multi-segment node (one segment per row): put that SAME
-  `ref` on that column's cell in EVERY row (the `row` index selects the segment).
-  Repeating a ref within a column is expected and correct.
-- Combine parallel content into ONE table: e.g. a year column + a Chinese column
-  + its English-translation column are three `col` values of the SAME table.
-- For a translation column, reference the TRANSLATION node directly by its `id`
-  (the item whose `translation_of` points at the source) — translations already
-  exist at this stage, so use their real ids.
-
-Output STRICT JSON only. No markdown. No commentary:
-{
-  "rows": <int>,
-  "cols": <int>,
-  "cells": [ { "row": <int>, "col": <int>, "ref": "<item id>" } ]
-}
-If the objective cannot be satisfied (e.g. no matching content), return
-{"rows": 0, "cols": 0, "cells": []}.
-"""
-
-
-def _repair_build_params(params: dict[str, Any]) -> list[str]:
-    # table.build is objective-driven now; it carries no structured params.
-    return []
-
-
-def _slim_items_for_build(texts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for t in texts:
-        if not isinstance(t, dict):
-            continue
-        if not str(t.get("text") or "").strip():
-            continue
-        item: dict[str, Any] = {
-            "id": str(t.get("id") or ""),
-            "kind": str(t.get("kind") or ""),
-            "text": str(t.get("text") or ""),
-        }
-        segs = t.get("segments")
-        if isinstance(segs, list) and len(segs) > 1 and all(isinstance(x, str) for x in segs):
-            item["segments"] = [str(x) for x in segs]
-        tof = str(t.get("translation_of") or "")
-        if tof:
-            item["translation_of"] = tof
-        items.append(item)
-    return items
-
-
-def _run_table(
-    *,
-    intent: dict[str, Any],
-    state: dict[str, Any],
-    api_key: str | None,
-    model: str,
-    dry_run: bool,
-    user_request: str = "",
-) -> SkillResult:
-    warnings: list[str] = []
-    iid = str(intent.get("id") or "")
+def _run(*, intent, state, api_key, model, dry_run, user_request="") -> SkillResult:
     objective = str(intent.get("objective") or "").strip()
-    if not objective:
-        warnings.append(f"table_empty_objective[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-
-    texts = state.get("texts") if isinstance(state.get("texts"), list) else []
-    valid_ids = {str(t.get("id") or "") for t in texts if isinstance(t, dict)}
-    items = _slim_items_for_build(texts)
-    if not items:
-        warnings.append(f"table_no_text_on_page[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-
-    if dry_run:
-        warnings.append(f"dry_run_stub_table_build: {iid}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-
-    payload = {
-        "user_request": user_request,
-        "objective": objective,
-        "items": items,
-    }
-    raw, obj, err = _call_claude_json(
-        model=model,
-        system_prompt=_BUILD_SYSTEM_PROMPT,
-        user_text=json.dumps(payload, ensure_ascii=False, indent=2),
-        max_output_tokens=4096,
-        tag="step2.table_build",
-        reasoning_effort="minimal",
-    )
-    if err:
-        warnings.append(f"table_build_call_error[{iid}]: {err}")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-    if not isinstance(obj, dict):
-        warnings.append(f"table_build_invalid_response[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-
-    try:
-        rows = int(obj.get("rows"))
-        cols = int(obj.get("cols"))
-    except (TypeError, ValueError):
-        warnings.append(f"table_bad_dims[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-    if rows <= 0 or cols <= 0:
-        warnings.append(f"table_nonpositive_dims[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-
-    raw_cells = obj.get("cells")
-    if not isinstance(raw_cells, list) or not raw_cells:
-        warnings.append(f"table_no_cells[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-
-    seen_rc: set[tuple[int, int]] = set()
-    cells_out: list[dict[str, Any]] = []
-    used_refs: set[str] = set()
-    for c_i, cell in enumerate(raw_cells):
-        if not isinstance(cell, dict):
-            warnings.append(f"table_cell[{iid}][{c_i}]_not_object")
+    texts = [t for t in state.get("texts", []) if isinstance(t, dict) and str(t.get("text") or "").strip() and t.get("kind") != "table_cell"]
+    for table in state.get("tables") or []:
+        if isinstance(table, dict):
+            for row in table.get("data") or []:
+                for cell in row if isinstance(row, list) else []:
+                    if isinstance(cell, dict) and str(cell.get("text") or "").strip():
+                        texts.append({"id": str(cell.get("id") or ""), "kind": "table_cell", "text": str(cell.get("text") or "")})
+    for image in state.get("images") or []:
+        if not isinstance(image, dict):
             continue
-        try:
-            r = int(cell.get("row"))
-            c = int(cell.get("col"))
-        except (TypeError, ValueError):
-            warnings.append(f"table_cell[{iid}][{c_i}]_bad_index")
-            continue
-        ref = str(cell.get("ref") or "")
-        if not (0 <= r < rows and 0 <= c < cols):
-            warnings.append(f"table_cell[{iid}][{c_i}]_out_of_bounds: {(r, c)}")
-            continue
-        if ref not in valid_ids:
-            warnings.append(f"table_cell[{iid}][{c_i}]_unknown_ref: {ref}")
-            continue
-        if (r, c) in seen_rc:
-            warnings.append(f"table_cell[{iid}][{c_i}]_duplicate_rc: {(r, c)}")
-            continue
-        seen_rc.add((r, c))
-        used_refs.add(ref)
-        cells_out.append({"row": r, "col": c, "ref": ref})
+        description = str(image.get("description_en") or "").strip()
+        if description:
+            texts.append({
+                "id": str(image.get("id") or ""),
+                "kind": "image_description",
+                "text": description,
+            })
+    if not objective: return SkillResult(warnings=["table_build_empty_objective"], status="failed")
+    if dry_run: return SkillResult(warnings=["dry_run_table_build"], status="already_satisfied")
+    payload = {"objective": objective, "items":[{"id":t.get("id"),"kind":t.get("kind"),"text":t.get("text")} for t in texts]}
+    raw, obj, err = _call_claude_json(model=model, system_prompt=_PROMPT, user_text=json.dumps(payload, ensure_ascii=False), max_output_tokens=4096, tag="step2.table_build", reasoning_effort="minimal")
+    if err or not isinstance(obj, dict): return SkillResult(warnings=[f"table_build_call_error: {err or 'invalid'}"], status="failed")
+    try: rows, cols = int(obj["rows"]), int(obj["cols"])
+    except (KeyError, TypeError, ValueError): return SkillResult(warnings=["table_build_bad_dimensions"], status="failed")
+    if rows < 1 or cols < 1 or rows > 100 or cols > 100: return SkillResult(warnings=["table_build_bad_dimensions"], status="failed")
+    by_id = {str(t.get("id")): t for t in texts}; raw_rows = obj.get("cells")
+    if not isinstance(raw_rows, list) or len(raw_rows) != rows: return SkillResult(warnings=["table_build_bad_cells"], status="failed")
+    data = []
+    used = set()
+    for r in range(rows):
+        out = []
+        source_row = raw_rows[r] if r < len(raw_rows) and isinstance(raw_rows[r], list) else []
+        for c in range(cols):
+            spec = source_row[c] if c < len(source_row) and isinstance(source_row[c], dict) else {}
+            ids = spec.get("source_ids") if isinstance(spec.get("source_ids"), list) else []
+            vals = [str(by_id[i].get("text") or "") for i in ids if str(i) in by_id]
+            used.update(str(i) for i in ids if str(i) in by_id)
+            text = str(spec.get("text") or "") if "text" in spec else " ".join(vals)
+            out.append({"id":f"tbl0_r{r}_c{c}","text":text,"rowspan":1,"colspan":1,"style":{}})
+        data.append(out)
+    existing_ids = {str(t.get("id") or "") for t in state.get("tables") or [] if isinstance(t, dict)}
+    table_id = next((f"tbl{i}" for i in range(1000) if f"tbl{i}" not in existing_ids), "tbl_new")
+    for row_index, row in enumerate(data):
+        for col_index, cell in enumerate(row):
+            cell["id"] = f"{table_id}_r{row_index}_c{col_index}"
+    table = {"id":table_id,"colWidths":[1/cols]*cols,"cellMinHeight":24,"outline":{"width":1,"style":"solid","color":"#eeece1"},"theme":{"color":"#67508F","rowHeader":False,"rowFooter":False,"colHeader":False,"colFooter":False},"data":data}
+    try: table = validate_table_spec(table)
+    except ValueError as exc: return SkillResult(warnings=[f"table_build_invalid_output: {exc}"], status="failed")
+    state.setdefault("tables", []).append(table)
+    consume = obj.get("consume_source_ids") if isinstance(obj.get("consume_source_ids"), list) else []
+    consume_ids = {str(x) for x in consume if str(x) in used}
+    state["texts"] = [t for t in state.get("texts", []) if str(t.get("id")) not in consume_ids]
+    return SkillResult(warnings=[f"table_built: {rows}x{cols}"], triggered_visual=True, status="applied")
 
-    if not cells_out:
-        warnings.append(f"table_no_valid_cells[{iid}]")
-        return SkillResult(warnings=warnings, triggered_visual=False)
-
-    tables = state.get("tables")
-    if not isinstance(tables, list):
-        tables = []
-        state["tables"] = tables
-    table_id = f"tbl{len(tables)}"
-    tables.append({"id": table_id, "rows": rows, "cols": cols, "cells": cells_out})
-    warnings.append(f"table_built[{iid}]: {rows}x{cols}, {len(used_refs)} refs")
-    return SkillResult(warnings=warnings, triggered_visual=True)
-
-
-_TABLE_PLAN_DOC = """  Organize content into a TABLE grid (rows x columns). Use ONLY when the user
-  EXPLICITLY asks for a table / columns / grid, e.g. "把这些做成表格", "make this
-  a two-column table", "add an English column next to the Chinese". Do NOT emit
-  this for ordinary lists/bullets or just because content looks aligned — step1
-  already detects visual tables on its own every round.
-  `objective` (natural language) MUST describe WHICH content goes into the table
-  and how it should be organized into columns/rows — e.g. "Put the year, metric,
-  and value content into a 3-column table, one row per year, and add the English
-  translation of the metric names as a 4th column." No `params` — the executor
-  runs after all text edits, sees the final text (including translations), and
-  works out the row/col → id mapping itself. Creating a table changes the layout,
-  so this skill REQUESTS a visual re-layout at runtime."""
-
-
-_TABLE_ORDERING_NOTE = (
-    "Runs in the TABLE phase, which the compiler forces to run AFTER all text "
-    "edits (redact/rewrite/translate). You do not need `after` edges to text "
-    "intents — just describe the table you want; the executor sees the final "
-    "text (including any translations) when it builds the grid."
-)
-
-
-SKILL = Skill(
-    id="table.build",
-    canonical_rank=3,
-    summary="organize content into a table grid (rows x columns)",
-    plan_doc=_TABLE_PLAN_DOC,
-    repair=_repair_build_params,
-    execute=_run_table,
-    ordering_note=_TABLE_ORDERING_NOTE,
-    phase="table",
-)
+SKILL = Skill(id="table.build", canonical_rank=3, summary="create one native table from semantic page content", plan_doc=_DOC, repair=_repair, execute=_run, ordering_note="Usually follows content transformations whose final results are sources for the new table.", phase="table")

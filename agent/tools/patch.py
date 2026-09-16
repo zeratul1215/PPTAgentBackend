@@ -16,6 +16,7 @@ import re
 import time
 import traceback
 from pathlib import Path
+from .table_spec import iter_cells, validate_table_spec
 from typing import Any
 
 from langchain.tools import ToolRuntime
@@ -26,8 +27,11 @@ from typing_extensions import NotRequired, TypedDict
 
 from agent_backend.agent.models import agent_model_name, build_chat_model
 from agent_backend.agent.tools.context import (
+    assert_unique_page_jobs,
     emit,
-    project_lock,
+    execute_page_jobs,
+    page_job,
+    require_agent_run_id,
     require_project_id,
     require_session_id,
     workspace_for,
@@ -39,6 +43,7 @@ from agent_backend.agent.tools.deck_style import public_style_row, require_ready
 from agent_backend.workspace import pageorder
 from agent_backend.workspace.paths import next_turn_dir, read_json, write_json, write_text
 from agent_backend.workspace.repo import record_turn
+from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.step_2_plan.skills import table_calc
 
 
 class PagePatch(TypedDict):
@@ -72,6 +77,27 @@ _SHAPE_ELEMENT_STYLE_KEYS = {"fill", "gradient", "outline", "shadow", "opacity"}
 _IMAGE_STYLE_KEYS = {"radius", "opacity", "filters", "outline", "shadow"}
 _PAGE_ELEMENT_ID = "$page"
 _PAGE_STYLE_KEYS = {"backgroundColor", "fill", "color"}
+_TABLE_SPEC_FIELDS = {"data", "colWidths", "cellMinHeight", "outline", "theme"}
+_TABLE_CELL_STYLE_KEYS = {"bold", "em", "underline", "strikethrough", "color", "backcolor", "fontname", "align", "vAlign"}
+_TABLE_OUTLINE_KEYS = {"width", "style", "color"}
+_TABLE_THEME_KEYS = {"color", "rowHeader", "rowFooter", "colHeader", "colFooter"}
+
+
+def _visible_table_cells(table: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index visible cells by id without mutating the validator's deep copy."""
+    visible: dict[str, dict[str, Any]] = {}
+    data = table.get("data") if isinstance(table.get("data"), list) else []
+    occupied: set[tuple[int, int]] = set()
+    for r, row in enumerate(data):
+        if not isinstance(row, list): continue
+        for c, cell in enumerate(row):
+            if not isinstance(cell, dict) or (r, c) in occupied: continue
+            rs, cs = int(cell.get("rowspan", 1) or 1), int(cell.get("colspan", 1) or 1)
+            for rr in range(r, r + rs):
+                for cc in range(c, c + cs): occupied.add((rr, cc))
+            cid = str(cell.get("id") or "")
+            if cid: visible[cid] = cell
+    return visible
 
 
 def _content_of(element: dict[str, Any]) -> str | None:
@@ -130,7 +156,43 @@ def _resource_item(element: dict[str, Any]) -> dict[str, Any] | None:
             "allowedOps": ["replace", "style_change", "delete"],
         }
     if etype == "image":
-        return {"elementId": element_id, "type": "image", "allowedOps": ["replace", "style_change", "delete"]}
+        item: dict[str, Any] = {
+            "elementId": element_id,
+            "type": "image",
+            "allowedOps": ["replace", "style_change", "delete"],
+        }
+        bbox = {}
+        for source, target in (("left", "x"), ("top", "y"), ("width", "w"), ("height", "h")):
+            value = _number(element.get(source))
+            if value is not None:
+                bbox[target] = round(value, 3)
+        if len(bbox) == 4:
+            item["bbox"] = bbox
+        return item
+    if etype == "table":
+        try:
+            table = validate_table_spec(element)
+            cells = [
+                {
+                    "cellId": cell["id"],
+                    "row": r,
+                    "col": c,
+                    "text": cell["text"],
+                    "rowspan": cell["rowspan"],
+                    "colspan": cell["colspan"],
+                }
+                for r, c, cell in iter_cells(table, include_placeholders=False)
+            ]
+            return {
+                "elementId": element_id,
+                "type": "table",
+                "cells": cells,
+                "allowedOps": [
+                    "replace", "style_change", "delete", "row_delete", "column_delete",
+                ],
+            }
+        except ValueError:
+            return {"elementId": element_id, "type": "table", "allowedOps": []}
     if etype == "shape":
         text = element.get("text")
         item: dict[str, Any] = {"elementId": element_id, "type": "shape", "allowedOps": ["delete"]}
@@ -151,7 +213,7 @@ def _slide_background_resource(slide: dict[str, Any]) -> dict[str, Any]:
     return {
         "elementId": _PAGE_ELEMENT_ID,
         "type": "page",
-        "description": "page canvas background; use this for requests that change the whole slide/page background",
+        "description": "page canvas background; supports backgroundColor style changes",
         "background": {"type": "solid", "color": color},
         "allowedOps": ["style_change"],
     }
@@ -261,29 +323,34 @@ def _slide_images(slide: dict[str, Any]) -> list[tuple[str, str]]:
     return out
 
 
-def _describe_images(slide: dict[str, Any]) -> dict[str, str]:
+def _describe_images(slide: dict[str, Any]) -> tuple[dict[str, str], str]:
     images = _slide_images(slide)
     if not images:
-        return {}
+        return {}, ""
     parts: list[dict[str, Any]] = [
-        {"type": "text", "text": "Describe each image briefly in order. Return JSON only: {\"images\":[{\"elementId\":\"...\",\"description\":\"...\"}]}."}
+        {"type": "text", "text": "Describe each image briefly. The text immediately before each image gives its exact elementId. Return JSON only: {\"images\":[{\"elementId\":\"...\",\"description\":\"...\"}]}."}
     ]
     ids: list[str] = []
     for element_id, src in images:
         if not src.startswith("data:image/"):
             continue
         ids.append(element_id)
+        parts.append({"type": "text", "text": f"elementId={element_id}"})
         parts.append({"type": "image_url", "image_url": {"url": src}})
     if not ids:
-        return {}
-    response = build_chat_model().invoke([HumanMessage(content=parts)])
-    data = _parse_json(response.content)
+        return {}, ""
+    try:
+        response = build_chat_model().invoke([HumanMessage(content=parts)])
+        raw = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False, default=str)
+        data = _parse_json(raw)
+    except Exception as exc:  # descriptions improve grounding but are not required for Patch
+        return {}, f"image_description_failed: {type(exc).__name__}: {exc}"
     described = data.get("images") if isinstance(data, dict) else None
     return {
         str(item.get("elementId")): str(item.get("description") or "").strip()
         for item in (described or [])
         if isinstance(item, dict) and str(item.get("elementId")) in ids and str(item.get("description") or "").strip()
-    }
+    }, raw
 
 
 def _pending_assets(paths, slot: int) -> tuple[list[dict[str, str]], Path]:
@@ -321,11 +388,16 @@ def _plan_operations(
         "role": "You are a PPT patch planner. Return JSON only.",
         "user_request": demand,
         "rules": [
-            "Use only replace, style_change, delete.",
+            "Use only replace, style_change, delete, calculate_and_replace, row_delete, or column_delete.",
             "Never add, move, resize, rotate, crop, fit, or change font size.",
             "replace text by paragraphId; replace image only with an available assetId.",
+            "For a table, replace cell text with {\"op\":\"replace\",\"elementId\":\"table-id\",\"cells\":[{\"cellId\":\"cell-id\",\"text\":\"new text\"}]}; never use delete to clear a cell.",
+            "For a table, row_delete/column_delete may remove an existing row or column by zero-based row/column index; they never add rows/columns and never change font size, bbox, or unrelated elements.",
+            "For table styles, use scope cells with cellIds or scope table with outline/theme; never change spans, widths, heights, or font size.",
+            "For numeric calculations use calculate_and_replace with op sum|mean|min|max|count, sourceCellIds/sourceElementIds and one targetCellId/targetElementId; never change table geometry.",
             "style_change must use only existing elementId and supported styles.",
             "For whole-page/slide background color changes, target elementId '$page' with scope 'element'.",
+            "For image targets, use the screenshot to identify the requested image, then match its position/content against the image item's bbox and description before choosing elementId. If the target is not unique, return no operation and explain the ambiguity.",
             "Do not create operations for items with empty allowedOps.",
         ],
         "resources": resource_copy,
@@ -339,8 +411,14 @@ def _plan_operations(
             "operations": [
                 {"op": "replace", "elementId": "id", "paragraphs": [{"paragraphId": "p0", "text": "new text"}]},
                 {"op": "replace", "elementId": "image-id", "assetId": "upload_0"},
+                {"op": "replace", "elementId": "table-id", "cells": [{"cellId": "cell-id", "text": "new text"}]},
+                {"op": "row_delete", "elementId": "table-id", "row": 0},
+                {"op": "column_delete", "elementId": "table-id", "column": 0},
+                {"op": "style_change", "elementId": "table-id", "scope": "cells", "cellIds": ["cell-id"], "changes": {"color": "#..."}},
+                {"op": "style_change", "elementId": "table-id", "scope": "table", "changes": {"outline": {}, "theme": {}}},
                 {"op": "style_change", "elementId": "id", "scope": "text|element", "paragraphIds": ["p0"], "changes": {"color": "#..."}},
                 {"op": "style_change", "elementId": "$page", "scope": "element", "changes": {"backgroundColor": "#..."}},
+                {"op": "calculate_and_replace", "opName": "sum", "sourceCellIds": ["cell-a"], "targetCellId": "cell-b"},
                 {"op": "delete", "elementId": "id"},
             ]
         },
@@ -440,6 +518,20 @@ def _apply_replace(slide: dict[str, Any], op: dict[str, Any], assets: dict[str, 
     if element is None:
         raise ValueError("replace target does not exist")
     etype = element.get("type")
+    if etype == "table":
+        changes = op.get("cells")
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("table replacement requires cells")
+        table = validate_table_spec(element)
+        by_id = _visible_table_cells(table)
+        for item in changes:
+            cid = str(item.get("cellId") or "") if isinstance(item, dict) else ""
+            if cid not in by_id: raise ValueError("table replacement references an unknown cell")
+            if not isinstance(item, dict) or "text" not in item:
+                raise ValueError("table replacement requires explicit cell text")
+            by_id[cid]["text"] = str(item.get("text") or "")
+        element.update({key: table[key] for key in _TABLE_SPEC_FIELDS})
+        return
     if etype == "image":
         asset_id = str(op.get("assetId") or "")
         path = assets.get(asset_id)
@@ -486,6 +578,25 @@ def _apply_style_change(slide: dict[str, Any], op: dict[str, Any]) -> None:
         raise ValueError("style_change requires allowed changes and may not change fontSize")
     scope = str(op.get("scope") or "element")
     etype = element.get("type")
+    if etype == "table":
+        table = validate_table_spec(element)
+        if scope == "cells":
+            ids = {str(x) for x in op.get("cellIds") or []}
+            visible = _visible_table_cells(table)
+            if not ids or ids - set(visible): raise ValueError("table style_change references unknown or hidden cells")
+            if set(changes) - _TABLE_CELL_STYLE_KEYS: raise ValueError("table cell style contains unsupported fields")
+            for cid in ids: visible[cid]["style"].update(changes)
+        elif scope == "table":
+            if set(changes) - {"outline", "theme"}: raise ValueError("table style contains unsupported fields")
+            if isinstance(changes.get("outline"), dict):
+                if set(changes["outline"]) - _TABLE_OUTLINE_KEYS: raise ValueError("table outline contains unsupported fields")
+                table["outline"].update(changes["outline"])
+            if isinstance(changes.get("theme"), dict):
+                if set(changes["theme"]) - _TABLE_THEME_KEYS: raise ValueError("table theme contains unsupported fields")
+                table["theme"].update(changes["theme"])
+        else: raise ValueError("table style_change scope must be cells or table")
+        element.update({key: table[key] for key in _TABLE_SPEC_FIELDS})
+        return
     if scope == "text":
         content = _content_of(element)
         if content is None:
@@ -528,6 +639,42 @@ def _apply_style_change(slide: dict[str, Any], op: dict[str, Any]) -> None:
     raise ValueError("style_change type is not supported")
 
 
+def _apply_calculate_and_replace(slide: dict[str, Any], op: dict[str, Any]) -> None:
+    operator = str(op.get("opName") or op.get("operator") or "sum")
+    if operator not in set(table_calc.operator_names()):
+        raise ValueError("unsupported calculation operator")
+    sources = {str(x) for x in (op.get("sourceCellIds") or []) if str(x)}
+    target_id = str(op.get("targetCellId") or "")
+    if not sources or not target_id:
+        raise ValueError("calculation requires sourceCellIds and targetCellId")
+    target = None
+    values: list[float] = []
+    for element in slide.get("elements") or []:
+        if not isinstance(element, dict): continue
+        if element.get("type") == "table":
+            table = validate_table_spec(element)
+            visible = _visible_table_cells(element)
+            for cid in sources:
+                if cid in visible:
+                    parsed = table_calc.parse_number(str(visible[cid].get("text") or ""))
+                    if parsed: values.append(parsed[0])
+            if target_id in visible: target = visible[target_id]
+        elif element.get("type") == "text" and str(element.get("id")) in {str(x) for x in (op.get("sourceElementIds") or [])}:
+            parsed = table_calc.parse_number(str(element.get("content") or ""))
+            if parsed: values.append(parsed[0])
+        elif element.get("type") == "text" and str(element.get("id")) == target_id:
+            target = element
+    if target is None: raise ValueError("calculation target does not exist")
+    if not values: raise ValueError("calculation has no numeric sources")
+    value = table_calc.format_number(table_calc.reduce_values(operator, values) or 0)
+    if "rowspan" in target or "colspan" in target:
+        target["text"] = value
+    elif target.get("type") == "text":
+        target["content"] = value
+    else:
+        raise ValueError("calculation target must be a text or table cell")
+
+
 def _apply_delete(slide: dict[str, Any], op: dict[str, Any]) -> None:
     element_id = str(op.get("elementId") or "")
     elements = slide.get("elements")
@@ -539,18 +686,166 @@ def _apply_delete(slide: dict[str, Any], op: dict[str, Any]) -> None:
         slide["animations"] = [a for a in animations if not (isinstance(a, dict) and a.get("elId") == element_id)]
 
 
+def _table_anchors(table: dict[str, Any]) -> list[tuple[int, int, dict[str, Any]]]:
+    """Return visible table anchors with their logical grid coordinates."""
+    data = table.get("data") if isinstance(table.get("data"), list) else []
+    rows = len(data)
+    cols = len(data[0]) if rows and isinstance(data[0], list) else 0
+    occupied: set[tuple[int, int]] = set()
+    anchors: list[tuple[int, int, dict[str, Any]]] = []
+    for r in range(rows):
+        row = data[r]
+        if not isinstance(row, list):
+            continue
+        for c in range(cols):
+            if (r, c) in occupied or not isinstance(row[c], dict):
+                continue
+            cell = copy.deepcopy(row[c])
+            rs = int(cell.get("rowspan", 1) or 1)
+            cs = int(cell.get("colspan", 1) or 1)
+            for rr in range(r, r + rs):
+                for cc in range(c, c + cs):
+                    occupied.add((rr, cc))
+            anchors.append((r, c, cell))
+    return anchors
+
+
+def _rebuild_table_grid(
+    table: dict[str, Any],
+    anchors: list[tuple[int, int, dict[str, Any]]],
+    rows: int,
+    cols: int,
+) -> None:
+    """Recreate the rectangular PPTist table matrix after a row/column deletion."""
+    if rows < 1 or cols < 1:
+        raise ValueError("table must retain at least one row and one column")
+    table_id = str(table.get("id") or "table")
+    grid: list[list[dict[str, Any] | None]] = [[None for _ in range(cols)] for _ in range(rows)]
+    for r, c, cell in anchors:
+        rs = int(cell.get("rowspan", 1) or 1)
+        cs = int(cell.get("colspan", 1) or 1)
+        if r < 0 or c < 0 or r + rs > rows or c + cs > cols:
+            raise ValueError("table deletion produced an invalid span")
+        for rr in range(r, r + rs):
+            for cc in range(c, c + cs):
+                if grid[rr][cc] is not None:
+                    raise ValueError("table deletion produced overlapping spans")
+                grid[rr][cc] = cell if (rr, cc) == (r, c) else {"_covered": True}
+    out: list[list[dict[str, Any]]] = []
+    for r in range(rows):
+        row: list[dict[str, Any]] = []
+        for c in range(cols):
+            value = grid[r][c]
+            if isinstance(value, dict) and not value.get("_covered"):
+                row.append(value)
+            else:
+                row.append({
+                    "id": f"{table_id}_r{r}_c{c}",
+                    "text": "",
+                    "rowspan": 1,
+                    "colspan": 1,
+                    "style": {},
+                })
+        out.append(row)
+    table["data"] = out
+
+
+def _apply_table_dimension_delete(slide: dict[str, Any], op: dict[str, Any], *, axis: str) -> None:
+    table_id = str(op.get("elementId") or "")
+    table = next(
+        (el for el in slide.get("elements") or []
+         if isinstance(el, dict) and el.get("type") == "table" and str(el.get("id") or "") == table_id),
+        None,
+    )
+    if table is None:
+        raise ValueError("table deletion target does not exist")
+    validate_table_spec(table)
+    data = table.get("data") or []
+    old_rows = len(data)
+    old_cols = len(data[0]) if old_rows else 0
+    key = "row" if axis == "row" else "column"
+    try:
+        index = int(op.get(key))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{axis}_delete requires a zero-based {key} index") from exc
+    limit = old_rows if axis == "row" else old_cols
+    if index < 0 or index >= limit:
+        raise ValueError(f"{axis}_delete index out of bounds")
+    if limit <= 1:
+        raise ValueError(f"cannot delete the last table {axis}")
+
+    transformed: list[tuple[int, int, dict[str, Any]]] = []
+    for r, c, cell in _table_anchors(table):
+        rs = int(cell.get("rowspan", 1) or 1)
+        cs = int(cell.get("colspan", 1) or 1)
+        if axis == "row":
+            if r == index and rs != 1:
+                raise ValueError("cannot delete a row containing a rowspan anchor; use table.rebuild")
+            if r == index:
+                continue
+            if r < index < r + rs:
+                rs -= 1
+            elif r > index:
+                r -= 1
+        else:
+            if c == index and cs != 1:
+                raise ValueError("cannot delete a column containing a colspan anchor; use table.rebuild")
+            if c == index:
+                continue
+            if c < index < c + cs:
+                cs -= 1
+            elif c > index:
+                c -= 1
+        if rs < 1 or cs < 1:
+            raise ValueError("table deletion produced an empty span")
+        cell["rowspan"], cell["colspan"] = rs, cs
+        transformed.append((r, c, cell))
+    _rebuild_table_grid(table, transformed, old_rows - (axis == "row"), old_cols - (axis == "column"))
+    if axis == "column":
+        old_widths = table.get("colWidths") if isinstance(table.get("colWidths"), list) else []
+        kept = [float(value) for idx, value in enumerate(old_widths) if idx != index]
+        total = sum(kept)
+        table["colWidths"] = [value / total for value in kept] if total > 0 else [1.0 / (old_cols - 1)] * (old_cols - 1)
+    validate_table_spec(table)
+
+
 def apply_operations(slide: dict[str, Any], operations: list[dict[str, Any]], assets: dict[str, Path]) -> dict[str, Any]:
     updated = copy.deepcopy(slide)
+    original_tables = {
+        str(element.get("id")): copy.deepcopy(element)
+        for element in slide.get("elements") or []
+        if isinstance(element, dict) and element.get("type") == "table" and element.get("id")
+    }
     for op in operations:
         kind = op.get("op")
         if kind == "replace":
             _apply_replace(updated, op, assets)
         elif kind == "style_change":
             _apply_style_change(updated, op)
+        elif kind == "calculate_and_replace":
+            _apply_calculate_and_replace(updated, op)
+        elif kind == "row_delete":
+            _apply_table_dimension_delete(updated, op, axis="row")
+        elif kind == "column_delete":
+            _apply_table_dimension_delete(updated, op, axis="column")
         elif kind == "delete":
             _apply_delete(updated, op)
         else:
             raise ValueError(f"unsupported patch operation: {kind!r}")
+    if updated == slide:
+        raise ValueError("patch operations produced no change")
+    updated_by_id = _element_index(updated)
+    for element_id, original in original_tables.items():
+        current = updated_by_id.get(element_id)
+        if current is None:
+            if not any(op.get("op") == "delete" and str(op.get("elementId") or "") == element_id for op in operations):
+                raise ValueError(f"table element disappeared during patch: {element_id}")
+            continue
+        for key in set(original) | set(current):
+            if key in _TABLE_SPEC_FIELDS:
+                continue
+            if current.get(key) != original.get(key):
+                raise ValueError(f"table element envelope changed during patch: {element_id}.{key}")
     return updated
 
 
@@ -558,18 +853,18 @@ def apply_operations(slide: dict[str, Any], operations: list[dict[str, Any]], as
 def patch_pages(patches: list[PagePatch], runtime: ToolRuntime, images_involved: bool = False) -> dict[str, Any]:
     """Apply layout-preserving edits directly to existing PPTist JSON pages.
 
-    Use this only when every requested final effect can be achieved without
-    adding/moving/resizing/reflowing elements or changing the page composition.
-    It supports replacing existing text, shape-contained text or an existing
-    image with a user-uploaded staged asset; changing existing styles except font
-    size; and deleting a complete element. Content-only translation, rewrite,
-    proofreading, redaction, and deletion of existing text belong here even when
-    a passage is split across multiple existing text elements. Use `edit_pages`
-    only when the final result needs layout changes, new content space,
-    reordering, or dependent changes to other elements. `patches` uses stable
-    page refs returned by get_deck_outline/locate_pages/understand_pages.
+    This tool mutates supported properties of existing elements without adding,
+    moving, resizing, or reflowing elements and without changing page composition.
+    Its supported operations are existing-content replacement, staged in-place
+    image replacement, supported non-font-size style changes, deterministic
+    calculation into an existing target, complete-element deletion, and deletion
+    of existing table rows or columns. Row/column deletion preserves the remaining
+    table content and geometry contract; adding rows or columns, changing spans,
+    or redesigning a table belongs in the full-page pipeline. `patches` uses stable
+    page refs returned by page-selection tools.
     """
     pid = require_project_id(runtime)
+    run_id = require_agent_run_id(runtime)
     try:
         sid = require_session_id(runtime)
     except Exception:
@@ -589,17 +884,22 @@ def patch_pages(patches: list[PagePatch], runtime: ToolRuntime, images_involved:
     style_needed = any(item[3] for item in parsed)
     deck_style_row = require_ready_style(pid, interrupt_when_unready=True) if style_needed else None
 
-    results: list[dict[str, Any]] = []
-    with project_lock(pid):
-        if style_needed:
-            latest = public_style_row(pid)
-            if latest.get("status") != "ready" or not isinstance(latest.get("style_json"), dict):
-                raise RuntimeError("deck style became unavailable before patching")
-            deck_style_row = latest
-        for index, (page, slot, demand, use_deck_style) in enumerate(parsed):
-            if slot is None:
-                results.append({"page": page, "ok": False, "status": "page_not_found"})
-                continue
+    assert_unique_page_jobs([int(item[1]) for item in parsed if item[1] is not None])
+    if style_needed:
+        latest = public_style_row(pid)
+        if latest.get("status") != "ready" or not isinstance(latest.get("style_json"), dict):
+            raise RuntimeError("deck style became unavailable before patching")
+        deck_style_row = latest
+
+    def _run_one(index: int) -> dict[str, Any]:
+        page, slot, demand, use_deck_style = parsed[index]
+        if slot is None:
+            return {"page": page, "ok": False, "status": "page_not_found"}
+        with page_job(pid, int(slot)):
+            current_page = pageorder.position_for_slot(paths, int(slot))
+            if current_page is None:
+                return {"page": page, "slot": int(slot), "ok": False, "status": "page_not_found"}
+            page = int(current_page)
             turn_dir = next_turn_dir(paths, int(slot))
             started_at = time.time()
             manifest_data: dict[str, Any] = {
@@ -616,7 +916,7 @@ def patch_pages(patches: list[PagePatch], runtime: ToolRuntime, images_involved:
                 "status": "running",
             }
             write_json(turn_dir / "manifest.json", manifest_data)
-            emit(pid, {"type": "task_started", "page": page, "slot": slot, "demand": demand, "index": index})
+            emit(pid, {"type": "task_started", "page": page, "slot": slot, "demand": demand, "index": index, "agent_run_id": run_id})
             try:
                 write_json(
                     turn_dir / "reread_result.json",
@@ -627,11 +927,12 @@ def patch_pages(patches: list[PagePatch], runtime: ToolRuntime, images_involved:
                 resources = build_resource_list(slide)
                 assets, manifest = _pending_assets(paths, int(slot))
                 asset_paths = {item["assetId"]: paths.page_assets_dir(int(slot)) / "uploads" / item["filename"] for item in assets}
-                descriptions = _describe_images(slide) if images_involved else {}
+                descriptions, descriptions_raw = _describe_images(slide) if images_involved else ({}, "")
                 write_json(turn_dir / "resource_list.json", resources)
                 write_json(turn_dir / "available_assets.json", [{"assetId": item["assetId"]} for item in assets])
                 if images_involved:
                     write_json(turn_dir / "image_descriptions.json", descriptions)
+                    write_text(turn_dir / "image_descriptions_response.txt", descriptions_raw)
                 page_png = paths.reread_page_png(int(slot))
                 if not page_png.exists():
                     page_png = paths.page_png(int(slot))
@@ -696,12 +997,12 @@ def patch_pages(patches: list[PagePatch], runtime: ToolRuntime, images_involved:
                     error=None,
                     turn_dir=str(turn_dir),
                 )
-                emit(pid, {"type": "task_finished", "page": page, "slot": slot, "demand": demand, "index": index, "turn_dir": str(turn_dir), "errors": [], "prepare_reread_png": True})
+                emit(pid, {"type": "task_finished", "page": page, "slot": slot, "demand": demand, "index": index, "turn_dir": str(turn_dir), "errors": [], "prepare_reread_png": True, "agent_run_id": run_id})
                 # The planner output and concrete mutator operations are audit
                 # artifacts, not conversational tool output. Keeping this
                 # response small prevents the outer agent from echoing element
                 # ids or operation JSON to the user.
-                results.append({"page": page, "ok": True, "status": "patched"})
+                return {"page": page, "ok": True, "status": "patched"}
             except Exception as exc:  # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"
                 manifest_data.update({
@@ -721,10 +1022,13 @@ def patch_pages(patches: list[PagePatch], runtime: ToolRuntime, images_involved:
                     error=error,
                     turn_dir=str(turn_dir),
                 )
-                emit(pid, {"type": "task_failed", "page": page, "slot": slot, "demand": demand, "index": index, "turn_dir": str(turn_dir), "error": error})
+                emit(pid, {"type": "task_failed", "page": page, "slot": slot, "demand": demand, "index": index, "turn_dir": str(turn_dir), "error": error, "agent_run_id": run_id})
                 # Keep the detailed exception in this turn's error.json. The
                 # outer agent only needs a stable failure state to respond.
-                results.append({"page": page, "ok": False, "status": "patch_failed"})
+                return {"page": page, "ok": False, "status": "patch_failed"}
+
+    results_by_index = execute_page_jobs(pid, [(i, int(item[1])) for i, item in enumerate(parsed)], _run_one)
+    results = [results_by_index[i] for i in range(len(parsed))]
     return {"project_id": pid, "ok": all(item.get("ok") for item in results), "results": results}
 
 

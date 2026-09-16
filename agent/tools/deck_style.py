@@ -20,7 +20,6 @@ from langgraph.types import interrupt
 from agent_backend.agent.models import build_chat_model
 from agent_backend.agent.tools.context import (
     emit,
-    project_lock,
     require_project_id,
     require_user_id,
     workspace_for,
@@ -222,7 +221,7 @@ def validate_style(raw: dict[str, Any], *, source: str | None = None) -> dict[st
         norm = normalize_color(c)
         if norm and norm not in top3:
             top3.append(norm)
-        if len(top3) >= 3:
+        if len(top3) >= 5:
             break
     typography_raw = raw.get("typography") if isinstance(raw.get("typography"), dict) else {}
 
@@ -306,12 +305,10 @@ def require_ready_style(project_id: str, *, interrupt_when_unready: bool = True)
 def get_deck_style(runtime: ToolRuntime, require_ready: bool = False) -> dict[str, Any]:
     """Read the active deck's visual style.
 
-    Use require_ready=true only when an upcoming edit genuinely depends on the
-    whole-deck style, such as creating a new page or when the user explicitly
-    requests the deck/document/selected-template style. Matching an existing
-    target page, its cover style, current colors, layout, or visual balance is
-    page-local and must use that page's screenshot instead. Existing-page edits
-    do not call this merely because they add content or change composition.
+    With `require_ready=false`, this returns the current status and any available
+    style. With `require_ready=true`, it returns a ready authoritative style or
+    enters the existing style gate. It describes whole-deck style, not page-local
+    appearance.
     """
     pid = require_project_id(runtime)
     if require_ready:
@@ -436,7 +433,7 @@ def _merge_facts(samples: list[dict[str, Any]]) -> dict[str, Any]:
             title_fonts[k] += float(v or 0)
         for k, v in (s.get("body_fonts") or {}).items():
             body_fonts[k] += float(v or 0)
-    top3 = [c for c, _ in sorted(colors.items(), key=lambda kv: kv[1], reverse=True)[:3]]
+    top3 = [c for c, _ in sorted(colors.items(), key=lambda kv: kv[1], reverse=True)[:5]]
 
     def top_font(values: dict[str, float]) -> str | None:
         return max(values.items(), key=lambda kv: kv[1])[0] if values else None
@@ -470,7 +467,7 @@ Mood catalog:
 
 Rules:
 - Choose exactly one moodId from the catalog.
-- Do not output colors as palette; deterministic colors will be merged by code.
+- Do not output colors as palette; the five deterministic colors will be merged by code.
 - Do not describe fonts; deterministic title/body fonts will be merged by code.
 - Describe reusable visual tendencies, not page-specific layout.
 - overallStyle must be concise: max 80 English words or 160 Chinese characters.
@@ -592,8 +589,7 @@ def start_style_analysis(project_id: str) -> dict[str, Any]:
 def bootstrap_style_analysis_async(project_id: str) -> None:
     def _run() -> None:
         try:
-            with project_lock(project_id):
-                start_style_analysis(project_id)
+            start_style_analysis(project_id)
         except Exception as exc:  # noqa: BLE001
             try:
                 repo.upsert_deck_style(

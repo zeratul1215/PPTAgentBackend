@@ -2,15 +2,13 @@
 
 This replaces the old split between Full Pipeline Step1 and reread. The
 persisted file is a small wrapper whose ``core`` field is exactly the historical
-``understand_output_v1`` object consumed by Step2.
+``understand_output_v2`` object consumed by Step2.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +18,10 @@ from typing_extensions import NotRequired, TypedDict
 
 from agent_backend.agent.models import agent_model_name
 from agent_backend.agent.tools.context import (
+    assert_unique_page_jobs,
     emit,
-    project_lock,
+    execute_page_jobs,
+    page_job,
     require_agent_run_id,
     require_project_id,
     workspace_for,
@@ -41,12 +41,6 @@ from agent_backend.workspace.dirty import clear_pending_reread, is_pending_rerea
 from agent_backend.workspace.paths import WorkspacePaths, read_json, write_json
 
 
-try:
-    MAX_PARALLEL_UNDERSTAND = max(1, int(os.environ.get("PPT_MAX_PARALLEL_UNDERSTAND", "3")))
-except ValueError:
-    MAX_PARALLEL_UNDERSTAND = 3
-
-
 class PageUnderstandRequest(TypedDict, total=False):
     page_ref: str
     focus: list[str]
@@ -60,18 +54,10 @@ FOCUS_ANSWER_LIMIT = 4000
 FOCUS_TOTAL_TEXT_LIMIT = 24000
 
 
-_COMMON_FOCUS_PROMPT = """You summarize ONE slide for a deck-level PPT agent.
+_COMMON_FOCUS_PROMPT = """Extract only the requested objective facts from ONE slide for a deck-level PPT agent.
 
 Return STRICT JSON only:
 {
-  "common": {
-    "title": "",
-    "page_type": "",
-    "topic": "",
-    "summary": "",
-    "key_points": [],
-    "language": ""
-  },
   "focused_results": [
     {"focus": "...", "answer": "..."}
   ]
@@ -79,7 +65,6 @@ Return STRICT JSON only:
 
 Rules:
 - Use the rendered slide image and the provided structured understanding.
-- common should be concise and useful for selecting pages and planning edits.
 - If focus_requests is empty, focused_results must be [].
 - For each focus request, answer only objective facts already present on the slide. Be specific.
 - Never write edit suggestions, generated copy, execution plans, routing decisions, or tool advice in focused_results.
@@ -304,18 +289,6 @@ def _call_common_focus(
         if err or not isinstance(obj, dict):
             warnings.append(f"common_focus_call_error: {err or 'invalid_json'}")
             return common, focused_results, warnings
-        got_common = obj.get("common")
-        if isinstance(got_common, dict):
-            common = {
-                "title": str(got_common.get("title") or common["title"]),
-                "page_type": str(got_common.get("page_type") or ""),
-                "topic": str(got_common.get("topic") or ""),
-                "summary": str(got_common.get("summary") or common["summary"]),
-                "key_points": [
-                    str(x) for x in (got_common.get("key_points") or []) if isinstance(x, (str, int, float))
-                ][:8],
-                "language": str(got_common.get("language") or ""),
-            }
         raw_results = obj.get("focused_results")
         if isinstance(raw_results, list):
             for item in raw_results:
@@ -342,7 +315,7 @@ def _load_wrapper(paths: WorkspacePaths, slot: int) -> dict[str, Any] | None:
         return None
     # Product is not live yet; old files are intentionally treated as missing so
     # v2 freshness/focus semantics stay simple.
-    if obj.get("schema_version") != "page_understanding_v2":
+    if obj.get("schema_version") != "page_understanding_v3":
         return None
     return obj
 
@@ -418,18 +391,18 @@ def ensure_page_understanding(
     try:
         if needs_full:
             understand_input = _build_understand_input(paths, slot)
-            core = run_step1(understand_input=understand_input, model=model, dry_run=dry_run)
+            full_result = run_step1(
+                understand_input=understand_input,
+                model=model,
+                dry_run=dry_run,
+                focus_requests=focus_items,
+            )
+            model_common = full_result.pop("_common", {})
+            focused_results = full_result.pop("_focused_results", [])
+            core = full_result
             core["page_num"] = int(slot)
             core["page_id"] = f"page{int(slot) - 1}"
-            png_path = Path(str(understand_input.get("page_png_path") or ""))
-            common, focused_results, extra_warnings = _call_common_focus(
-                core=core,
-                png_path=png_path,
-                focus=focus_items,
-                model=model,
-            )
-            if extra_warnings:
-                core.setdefault("warnings", []).extend(extra_warnings)
+            common = model_common if isinstance(model_common, dict) and model_common else _default_common(core)
             focused = {
                 "entries": _append_focus_entries(
                     [],
@@ -439,7 +412,7 @@ def ensure_page_understanding(
                 )
             }
             wrapper = {
-                "schema_version": "page_understanding_v2",
+                "schema_version": "page_understanding_v3",
                 "core": core,
                 "common": common,
                 "focused": focused,
@@ -528,9 +501,8 @@ def _tool_view(paths: WorkspacePaths, slot: int, wrapper: dict[str, Any], agent_
 def understand_pages(pages: list[PageUnderstandRequest], runtime: ToolRuntime, inspect_only: bool = False) -> dict[str, Any]:
     """Understand one or more pages and optionally extract focused information.
 
-    Use this when page content affects planning, page selection, cross-page
-    summaries, or deterministic text you must embed into later edit demands. Use
-    inspect_only=true first to see whether cached focused facts can be reused.
+    Returns current page understanding and optional focused factual extraction.
+    `inspect_only=true` lists reusable focused facts without invoking a model.
     Each item is {"page_ref": "page@<stable id>", "focus": ["..."],
     "reuse_focus_ids": ["..."], "force_new_focus": true}. Use
     force_new_focus only after inspecting cached focus and deciding the new
@@ -566,81 +538,68 @@ def understand_pages(pages: list[PageUnderstandRequest], runtime: ToolRuntime, i
     if not order:
         return {"project_id": pid, "ok": False, "error": "no valid page_ref values"}
 
-    results_by_slot: dict[int, dict[str, Any]] = {}
-    with project_lock(pid):
-        if inspect_only:
-            return {
-                "project_id": pid,
-                "ok": True,
-                "revision": pageorder.revision(paths),
-                "inspect_only": True,
-                "pages": [_inspect_view(paths, slot) for slot in order],
-            }
-        preflight_pages: list[dict[str, Any]] = []
-        for slot in order:
-            view = _inspect_view(paths, slot)
-            has_current_focus = (
-                view.get("understanding_status") == "current"
-                and bool(view.get("available_focus"))
+    assert_unique_page_jobs(order)
+    if inspect_only:
+        def _inspect(index: int) -> dict[str, Any]:
+            slot = order[index]
+            with page_job(pid, slot):
+                return _inspect_view(paths, slot)
+
+        inspected = execute_page_jobs(pid, [(i, slot) for i, slot in enumerate(order)], _inspect)
+        return {
+            "project_id": pid,
+            "ok": True,
+            "revision": pageorder.revision(paths),
+            "inspect_only": True,
+            "pages": [inspected[i] for i in range(len(order))],
+        }
+
+    preflight_pages = []
+    for slot in order:
+        view = _inspect_view(paths, slot)
+        has_current_focus = view.get("understanding_status") == "current" and bool(view.get("available_focus"))
+        asks_new_focus = bool(merged[slot]["focus"])
+        confirms_new_focus = bool(merged[slot].get("force_new_focus"))
+        reuses_focus = bool(merged[slot]["reuse_focus_ids"])
+        if has_current_focus and asks_new_focus and not confirms_new_focus and not reuses_focus:
+            preflight_pages.append(view)
+    if preflight_pages:
+        return {
+            "project_id": pid,
+            "ok": False,
+            "error": "focus_preflight_required",
+            "revision": pageorder.revision(paths),
+            "inspect_only": True,
+            "pages": preflight_pages,
+            "hint": (
+                "Review available_focus semantically first. Then call understand_pages "
+                "with reuse_focus_ids for covered facts, and set force_new_focus=true "
+                "only for genuinely missing focus directions."
+            ),
+        }
+
+    def _understand(index: int) -> dict[str, Any]:
+        slot = order[index]
+        with page_job(pid, slot):
+            wrapper = ensure_page_understanding(
+                paths=paths,
+                project_id=pid,
+                slot=slot,
+                display_page=pageorder.position_for_slot(paths, slot),
+                model=model,
+                focus=merged[slot]["focus"],
+                reuse_focus_ids=merged[slot]["reuse_focus_ids"],
+                agent_run_id=agent_run_id,
             )
-            asks_new_focus = bool(merged[slot]["focus"])
-            confirms_new_focus = bool(merged[slot].get("force_new_focus"))
-            reuses_focus = bool(merged[slot]["reuse_focus_ids"])
-            if has_current_focus and asks_new_focus and not confirms_new_focus and not reuses_focus:
-                preflight_pages.append(view)
-        if preflight_pages:
-            return {
-                "project_id": pid,
-                "ok": False,
-                "error": "focus_preflight_required",
-                "revision": pageorder.revision(paths),
-                "inspect_only": True,
-                "pages": preflight_pages,
-                "hint": (
-                    "Review available_focus semantically first. Then call understand_pages "
-                    "with reuse_focus_ids for covered facts, and set force_new_focus=true "
-                    "only for genuinely missing focus directions."
-                ),
-            }
-        max_workers = min(MAX_PARALLEL_UNDERSTAND, len(order))
-        if max_workers <= 1:
-            for slot in order:
-                wrapper = ensure_page_understanding(
-                    paths=paths,
-                    project_id=pid,
-                    slot=slot,
-                    display_page=pageorder.position_for_slot(paths, slot),
-                    model=model,
-                    focus=merged[slot]["focus"],
-                    reuse_focus_ids=merged[slot]["reuse_focus_ids"],
-                    agent_run_id=agent_run_id,
-                )
-                results_by_slot[slot] = _tool_view(paths, slot, wrapper, agent_run_id)
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="understand") as pool:
-                futures = {
-                    pool.submit(
-                        ensure_page_understanding,
-                        paths=paths,
-                        project_id=pid,
-                        slot=slot,
-                        display_page=pageorder.position_for_slot(paths, slot),
-                        model=model,
-                        focus=merged[slot]["focus"],
-                        reuse_focus_ids=merged[slot]["reuse_focus_ids"],
-                        agent_run_id=agent_run_id,
-                    ): slot
-                    for slot in order
-                }
-                for fut in as_completed(futures):
-                    slot = futures[fut]
-                    results_by_slot[slot] = _tool_view(paths, slot, fut.result(), agent_run_id)
+            return _tool_view(paths, slot, wrapper, agent_run_id)
+
+    results_by_index = execute_page_jobs(pid, [(i, slot) for i, slot in enumerate(order)], _understand)
 
     return {
         "project_id": pid,
         "ok": True,
         "revision": pageorder.revision(paths),
-        "pages": [results_by_slot[s] for s in order if s in results_by_slot],
+        "pages": [results_by_index[i] for i in range(len(order)) if i in results_by_index],
     }
 
 
