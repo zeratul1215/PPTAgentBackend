@@ -11,11 +11,11 @@ matrix. The output may change rows, columns, ordering, grouping, text, and spans
 It preserves the target table ID and envelope, and fixed code validates the full
 replacement matrix. Structured params are `{"table_id":"existing-table-id"}`;
 the id is required when more than one table exists on the page."""
-_PROMPT = """Return JSON only: {\"rows\":1,\"cols\":1,\"cells\":[[{\"text\":\"...\",\"rowspan\":1,\"colspan\":1,\"style_source_cell_id\":\"optional-existing-cell-id\"}]]}.
+_PROMPT = """Return JSON only: {\"rows\":1,\"cols\":1,\"cells\":[[{\"text\":\"...\",\"rowspan\":1,\"colspan\":1}]]}.
 Produce the complete replacement matrix for the requested table. Keep facts and
 user-provided wording. Use merges only when clearly required. You may use
-page_items as factual source material. Set style_source_cell_id only when a new
-cell should inherit one supplied existing cell's style."""
+ page_items as factual source material. Output structure and content only; do not
+ output styles, colors, fonts, or style-source references."""
 
 def _repair(params: dict[str, Any]) -> list[str]: return []
 
@@ -68,22 +68,17 @@ def _run(*, intent, state, api_key, model, dry_run, user_request="") -> SkillRes
     if semantic_candidate == semantic_original:
         return SkillResult(warnings=["table_rebuild_no_change"], status="already_satisfied")
 
-    source_styles = {
-        str(cell.get("id") or ""): deepcopy(cell.get("style") or {})
-        for row in original["data"]
-        for cell in row
-        if isinstance(cell, dict) and str(cell.get("id") or "")
-    }
     same_shape = rows == len(original["data"]) and cols == len(original["data"][0])
     data = []
     for r, row in enumerate(raw_rows):
         out = []
         for c, raw in enumerate(row):
             raw = raw if isinstance(raw, dict) else {}
-            source_id = str(raw.get("style_source_cell_id") or "")
-            fallback_style = original["data"][r][c].get("style") if same_shape else {}
-            style = deepcopy(source_styles.get(source_id, fallback_style or {}))
             cell_id = str(original["data"][r][c].get("id") or "") if same_shape else f"{original['id']}_r{r}_c{c}"
+            # Style remains outside the skill's contract. Existing envelope
+            # styles are preserved by the copied table; new cells are neutral
+            # scaffolding for Step3 to style.
+            style = deepcopy(original["data"][r][c].get("style") or {}) if same_shape else {}
             out.append({"id": cell_id, "text": str(raw.get("text") or ""), "rowspan": raw.get("rowspan", 1), "colspan": raw.get("colspan", 1), "style": style})
         data.append(out)
     candidate = dict(original)

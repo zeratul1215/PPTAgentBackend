@@ -95,45 +95,6 @@ def run_step2(
 
 
 # ---------------------------------------------------------------------------
-# Step 2.5 (beautify reference image) — only when the resolved visual_intent
-# is enabled. Produces a high-fidelity reference image that step3 replicates.
-# ---------------------------------------------------------------------------
-
-
-def step2_has_layout_intent(step2_output: dict[str, Any]) -> bool:
-    _, _, s3, _ = _load_step_modules()
-    return bool(s3._has_layout_intent(step2_output))
-
-
-def run_beautify_reference_image(
-    *,
-    step2_output: dict[str, Any],
-    out_path: Path,
-    original_understanding: dict[str, Any] | None = None,
-    deck_style: dict[str, Any] | None = None,
-    creation_mode: bool = False,
-    force_generation: bool = False,
-) -> dict[str, Any]:
-    """Generate the beautify reference image for one page.
-
-    Raises RuntimeError on backend/config/API failure; the caller (graph node)
-    is responsible for degrading gracefully (step3 falls back to the original
-    page render when no reference image is available).
-    """
-    img_mod = importlib.import_module(
-        "agent_backend.agent.tools.heavy_tool_impl.single_page_edition.step_2_plan.image_reference_gen"
-    )
-    return img_mod.generate_beautify_reference_image(
-        step2_output=step2_output,
-        out_path=Path(out_path),
-        original_understanding=original_understanding,
-        deck_style=deck_style,
-        creation_mode=bool(creation_mode),
-        force_generation=bool(force_generation),
-    )
-
-
-# ---------------------------------------------------------------------------
 # Step 3 (reassemble, single page) — we reuse the private helpers because
 # step3 ships a `main()` only.
 # ---------------------------------------------------------------------------
@@ -286,11 +247,17 @@ def run_step3_single_page(
     _reassemble_runtime_index_html(bundle_dir=bundle_dir, title=title)
 
     visual_self_check: dict[str, Any]
-    enabled = str(os.environ.get("PPT_STEP3_VISUAL_SELF_CHECK", "1")).strip().lower() not in {
-        "0", "false", "no", "off"
+    enabled = str(os.environ.get("PPT_STEP3_VISUAL_SELF_CHECK", "0")).strip().lower() in {
+        "1", "true", "yes", "on"
     }
     if not enabled:
-        visual_self_check = {"status": "disabled", "severity": "none", "repair_applied": False}
+        visual_self_check = {
+            "status": "skipped",
+            "reason": "disabled_by_config",
+            "verdict": "not_run",
+            "severity": "none",
+            "repair_applied": False,
+        }
     elif not used_beautify_reference or not ref_s or not Path(ref_s).exists():
         visual_self_check = {
             "status": "skipped",

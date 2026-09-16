@@ -14,6 +14,9 @@
 -- checkpoint_writes, ...) and creates them via its own .setup(); we do NOT
 -- define them here.
 
+-- Derived resource embeddings are metadata. Resource payloads stay on disk.
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE IF NOT EXISTS users (
     user_id      TEXT PRIMARY KEY,          -- opaque uuid
     username     TEXT NOT NULL,             -- login handle (what the user types)
@@ -176,24 +179,61 @@ CREATE TABLE IF NOT EXISTS session_states (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS artifacts (
-    artifact_ref     TEXT PRIMARY KEY,
-    user_id          TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    session_id       TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    message_id       TEXT REFERENCES chat_messages(message_id) ON DELETE SET NULL,
-    filename         TEXT NOT NULL,
-    mime             TEXT NOT NULL,
-    size_bytes       BIGINT NOT NULL DEFAULT 0,
-    width            INT,
-    height           INT,
-    sha256           TEXT NOT NULL,
-    storage_path     TEXT NOT NULL,
-    thumbnail_path   TEXT,
-    status           TEXT NOT NULL CHECK (status IN ('draft', 'attached', 'deleted')) DEFAULT 'draft',
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+-- Canonical multimodal resources for one conversation session. PostgreSQL
+-- stores metadata and searchable descriptions only; files live in the
+-- per-session resource directory.
+CREATE TABLE IF NOT EXISTS session_resources (
+    resource_ref       TEXT PRIMARY KEY,
+    session_id         TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    user_id            TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    kind               TEXT NOT NULL CHECK (kind IN ('image', 'table', 'page', 'file')),
+    source_kind        TEXT NOT NULL CHECK (source_kind IN ('user_upload', 'deck_element', 'generated', 'external')),
+    description        TEXT NOT NULL DEFAULT '',
+    description_status TEXT NOT NULL CHECK (description_status IN ('pending', 'ready', 'failed')) DEFAULT 'pending',
+    embedding          vector,
+    embedding_model    TEXT,
+    status             TEXT NOT NULL CHECK (status IN ('draft', 'ready', 'deleted')) DEFAULT 'draft',
+    content_hash       TEXT NOT NULL,
+    source_locator     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_message_id TEXT REFERENCES chat_messages(message_id) ON DELETE SET NULL,
+    created_run_id     TEXT,
+    created_seq        BIGINT,
+    last_mentioned_seq BIGINT,
+    last_used_seq      BIGINT,
+    pinned             BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at         TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_artifacts_session_created
-    ON artifacts(session_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_artifacts_draft_cleanup
-    ON artifacts(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_session_resources_scope
+    ON session_resources(session_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_resources_recent
+    ON session_resources(session_id, last_mentioned_seq DESC, last_used_seq DESC);
+CREATE INDEX IF NOT EXISTS idx_session_resources_hash
+    ON session_resources(session_id, content_hash);
+
+CREATE TABLE IF NOT EXISTS session_resource_files (
+    resource_ref  TEXT NOT NULL REFERENCES session_resources(resource_ref) ON DELETE CASCADE,
+    role          TEXT NOT NULL CHECK (role IN ('original', 'structure', 'preview')),
+    relative_path TEXT NOT NULL,
+    mime_type     TEXT NOT NULL,
+    byte_size     BIGINT NOT NULL DEFAULT 0,
+    sha256        TEXT NOT NULL,
+    width         INT,
+    height        INT,
+    PRIMARY KEY (resource_ref, role)
+);
+
+CREATE TABLE IF NOT EXISTS session_resource_mentions (
+    resource_ref TEXT NOT NULL REFERENCES session_resources(resource_ref) ON DELETE CASCADE,
+    message_id   TEXT REFERENCES chat_messages(message_id) ON DELETE CASCADE,
+    agent_run_id TEXT,
+    relation     TEXT NOT NULL CHECK (relation IN ('uploaded', 'mentioned', 'captured', 'staged', 'used')),
+    message_seq  BIGINT,
+    details      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE session_resource_mentions
+    ADD COLUMN IF NOT EXISTS details JSONB NOT NULL DEFAULT '{}'::jsonb;
+CREATE INDEX IF NOT EXISTS idx_session_resource_mentions_message
+    ON session_resource_mentions(message_id, created_at);

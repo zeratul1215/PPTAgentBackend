@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -799,6 +800,7 @@ def compile_step(
     visual_requirements = str(plan_visual.get("requirements_text") or "")
 
     state = _clone_understand(understand_output)
+    table_render_context: dict[str, Any] = {"built_table_ids": [], "rebuilt_tables": []}
     ordered, w = _topo_sort_intents([it for it in intents if isinstance(it, dict)])
     warnings.extend(w)
 
@@ -816,6 +818,11 @@ def compile_step(
             )
             continue
         try:
+            tables_before = {
+                str(table.get("id") or ""): deepcopy(table)
+                for table in state.get("tables") or []
+                if isinstance(table, dict) and str(table.get("id") or "")
+            }
             _t0 = time.monotonic()
             result = skill.execute(
                 intent=intent,
@@ -870,6 +877,80 @@ def compile_step(
                 warnings.extend(result.warnings or [f"skill outcome={result.status}"])
                 fatal_errors.append(f"intent {intent.get('id') or '?'} ({skill_id}) failed")
                 continue
+            tables_after = {
+                str(table.get("id") or ""): table
+                for table in state.get("tables") or []
+                if isinstance(table, dict) and str(table.get("id") or "")
+            }
+            if skill_id == "table.rebuild":
+                # Rebuild owns matrix content/structure only. Restore the
+                # authoritative style snapshot before checking invariants so a
+                # missing-vs-empty style representation cannot become a false
+                # fatal error.
+                params = intent.get("params") if isinstance(intent.get("params"), dict) else {}
+                target_id = str(params.get("table_id") or "")
+                if not target_id and len(tables_before) == 1:
+                    target_id = next(iter(tables_before))
+                before_table, after_table = tables_before.get(target_id), tables_after.get(target_id)
+                if before_table is not None and after_table is not None:
+                    for field in ("outline", "theme", "cellMinHeight"):
+                        if field in before_table:
+                            after_table[field] = deepcopy(before_table[field])
+                    before_cells = {
+                        str(cell.get("id")): cell.get("style") or {}
+                        for row in before_table.get("data") or []
+                        for cell in row if isinstance(row, list) and isinstance(cell, dict)
+                    }
+                    for row in after_table.get("data") or []:
+                        for cell in row if isinstance(row, list) else []:
+                            if isinstance(cell, dict) and str(cell.get("id")) in before_cells:
+                                cell["style"] = deepcopy(before_cells[str(cell.get("id"))])
+                    before_style = {
+                        "outline": before_table.get("outline"), "theme": before_table.get("theme"),
+                        "cellMinHeight": before_table.get("cellMinHeight"),
+                    }
+                    after_style = {
+                        "outline": after_table.get("outline"), "theme": after_table.get("theme"),
+                        "cellMinHeight": after_table.get("cellMinHeight"),
+                    }
+                    after_cells = {
+                        str(cell.get("id")): cell.get("style") or {}
+                        for row in after_table.get("data") or []
+                        for cell in row if isinstance(row, list) and isinstance(cell, dict)
+                    }
+                    if before_style != after_style:
+                        fatal_errors.append(f"intent {intent.get('id') or '?'} (table.rebuild) changed table style")
+                        warnings.append("compile_table_rebuild_style_changed")
+                        continue
+                    if any(after_cells.get(cell_id) != style for cell_id, style in before_cells.items() if cell_id in after_cells):
+                        fatal_errors.append(f"intent {intent.get('id') or '?'} (table.rebuild) changed existing cell style")
+                        warnings.append("compile_table_rebuild_cell_style_changed")
+                        continue
+            if skill_id == "table.build":
+                table_render_context["built_table_ids"].extend(
+                    table_id for table_id in tables_after
+                    if table_id not in tables_before and table_id not in table_render_context["built_table_ids"]
+                )
+            elif skill_id == "table.rebuild":
+                params = intent.get("params") if isinstance(intent.get("params"), dict) else {}
+                target_id = str(params.get("table_id") or "")
+                if not target_id and len(tables_before) == 1:
+                    target_id = next(iter(tables_before))
+                original_table = tables_before.get(target_id)
+                if original_table is not None and target_id in tables_after:
+                    table_render_context["rebuilt_tables"].append({
+                        "table_id": target_id,
+                        "original_style": {
+                            "outline": deepcopy(original_table.get("outline") or {}),
+                            "theme": deepcopy(original_table.get("theme") or {}),
+                            "cellMinHeight": original_table.get("cellMinHeight"),
+                            "cell_styles": [
+                                {"id": str(cell.get("id") or ""), "style": deepcopy(cell.get("style") or {})}
+                                for row in original_table.get("data") or []
+                                for cell in row if isinstance(row, list) and isinstance(cell, dict)
+                            ],
+                        },
+                    })
             executed_ids.append(str(intent.get("id") or ""))
             prune_notes = _prune_dangling_text_refs(state)
             if prune_notes:
@@ -903,6 +984,7 @@ def compile_step(
         "fatal_errors": fatal_errors,
         "visual_intent": resolved_visual,
         "understand_modified": state,
+        "table_render_context": table_render_context,
     }
     return out, warnings
 

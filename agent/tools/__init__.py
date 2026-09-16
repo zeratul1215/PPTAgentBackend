@@ -12,6 +12,8 @@ through a small, curated toolset:
   pages.
 * Structure: ``delete_pages`` / ``add_page`` / ``move_page`` — mutate the deck's
   ordered page list (never renumber on-disk slots).
+* Resources: ``search_session_resources`` / ``inspect_session_resources`` /
+  ``list_page_resources`` / ``capture_page_resources`` / ``stage_page_resource``.
 
 Page numbers passed to these tools are 1-based *display positions*; the tools
 resolve them to stable slots via ``workspace.pageorder`` so add/delete/reorder
@@ -26,10 +28,13 @@ immediately.
 
 from __future__ import annotations
 
-import os
-
-from agent_backend.agent.tools.assets import stage_page_asset
-from agent_backend.agent.tools.chat_artifacts import inspect_chat_artifacts
+from agent_backend.agent.tools.assets import stage_page_resource
+from agent_backend.agent.tools.chat_artifacts import (
+    get_recent_session_resources,
+    inspect_session_resources,
+    search_session_resources,
+)
+from agent_backend.agent.tools.session_resources import capture_page_resources, list_page_resources
 from agent_backend.agent.tools.context import AgentContext, set_progress_publisher
 from agent_backend.agent.tools.deck_style import get_deck_style
 from agent_backend.agent.tools.patch import patch_pages
@@ -43,19 +48,10 @@ from agent_backend.agent.tools.pages import add_page, delete_pages, move_page
 from agent_backend.agent.tools.progress import report_progress
 
 
-def _with_reference_image_enabled() -> bool:
-    value = os.environ.get("PPT_PIPELINE_WITH_REFERENCE_IMAGE", "0").strip().lower()
-    return value in {"1", "true", "yes", "on", "with", "with_reference_image"}
+from agent_backend.agent.tools.pipeline_without_reference_image.edit import edit_pages
+from agent_backend.agent.tools.pipeline_without_reference_image.fill import fill_empty_pages
 
-
-if _with_reference_image_enabled():
-    from agent_backend.agent.tools.edit import edit_pages
-    from agent_backend.agent.tools.fill import fill_empty_pages
-    PIPELINE_VARIANT = "with_reference_image"
-else:
-    from agent_backend.agent.tools.pipeline_without_reference_image.edit import edit_pages
-    from agent_backend.agent.tools.pipeline_without_reference_image.fill import fill_empty_pages
-    PIPELINE_VARIANT = "without_reference_image"
+PIPELINE_VARIANT = "without_reference_image"
 
 ALL_TOOLS = [
     list_decks,
@@ -70,8 +66,12 @@ ALL_TOOLS = [
     delete_pages,
     add_page,
     move_page,
-    stage_page_asset,
-    inspect_chat_artifacts,
+    stage_page_resource,
+    inspect_session_resources,
+    search_session_resources,
+    get_recent_session_resources,
+    list_page_resources,
+    capture_page_resources,
     report_progress,
 ]
 
@@ -91,7 +91,11 @@ __all__ = [
     "delete_pages",
     "add_page",
     "move_page",
-    "stage_page_asset",
-    "inspect_chat_artifacts",
+    "stage_page_resource",
+    "inspect_session_resources",
+    "search_session_resources",
+    "get_recent_session_resources",
+    "list_page_resources",
+    "capture_page_resources",
     "report_progress",
 ]

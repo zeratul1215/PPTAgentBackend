@@ -64,10 +64,7 @@ def _normalize_critic(value: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     verdict = str(value.get("verdict") or "").strip().lower()
     severity = str(value.get("severity") or "").strip().lower()
-    # Accept the older critic vocabulary, but normalize it before any commit
-    # decision.  A critic saying fail/critical must never be reported as pass.
-    if verdict in {"fail", "failed"}:
-        verdict = "revise"
+    # The current critic contract uses only pass/revise verdicts.
     if severity in {"critical", "high"}:
         severity = "major"
     if verdict not in {"pass", "revise"} or severity not in {"none", "minor", "major"}:

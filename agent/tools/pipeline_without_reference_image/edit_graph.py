@@ -31,10 +31,8 @@ from agent_backend.workspace.paths import (
 from agent_backend.workspace.html_lineage import current_candidate, write_lineage
 from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.reread import _materialize_images
 from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.steps import (
-    run_beautify_reference_image,
     run_step2,
     run_step4_qa,
-    step2_has_layout_intent,
 )
 from agent_backend.agent.tools.pipeline_without_reference_image.no_reference_step3 import (
     run_step3_without_reference,
@@ -86,15 +84,8 @@ class PipelineState(TypedDict, total=False):
     deck_style_revision: int
     html_lineage_candidate: dict[str, Any]
 
-    # Resume-from-checkpoint: when the previous turn for this page succeeded
-    # through step2 (+ beautify) but died at step3, we reuse those artefacts
-    # instead of re-planning and re-generating the (expensive) reference image.
-    resumed_step2_output: dict[str, Any]
-    resumed_beautify_reference_image_path: str
-
     # Per-step artefacts
     step2_output: dict[str, Any]
-    beautify_reference_image_path: str
     step3_result: dict[str, Any]
     step4_result: dict[str, Any]
 
@@ -121,7 +112,6 @@ def _paths_from_state(state: PipelineState) -> WorkspacePaths:
 _STAGE_LABELS: dict[str, str] = {
     "understand": "正在理解页面",
     "plan": "正在规划改动",
-    "beautify_image": "正在设计新版式",
     "reassemble": "正在生成页面",
     "visual_check": "正在核对页面效果",
     "qa": "正在检查排版",
@@ -173,87 +163,6 @@ def _step2_output_is_valid(step2_output: Any) -> bool:
         return False
     # texts is the primary payload; images may legitimately be empty.
     return isinstance(um.get("texts"), list)
-
-
-def _find_resumable_turn(
-    *, paths: WorkspacePaths, page_num: int, demand: str, exclude_dir: Path
-) -> dict[str, Any] | None:
-    """Detect whether the immediately-preceding turn for this page died at
-    step3 while step2 (+ beautify) had already produced valid artefacts.
-
-    Only the single most-recent prior turn is considered (scope=prev_turn):
-    a turn is resumable iff its recorded demand matches the current one, its
-    step2_output is present+valid, its beautify stage completed (ok or
-    skipped), and it has NO step3_result.json (i.e. it stopped at step3).
-
-    Returns {"step2_output": dict, "beautify_reference_image_path": str} or
-    None when nothing is safely reusable.
-    """
-    turns_dir = paths.turns_dir(page_num)
-    if not turns_dir.exists():
-        return None
-    candidates = [
-        d for d in turns_dir.glob("turn_*")
-        if d.is_dir() and d.resolve() != exclude_dir.resolve()
-    ]
-    if not candidates:
-        return None
-    prev = max(candidates, key=_turn_index)
-
-    # Must have stopped exactly at step3.
-    if (prev / "step3_result.json").exists():
-        return None
-
-    # Demand must match the current request to avoid cross-edit reuse.
-    req_path = prev / "step2_request.json"
-    if not req_path.exists():
-        return None
-    try:
-        prev_demand = str((read_json(req_path) or {}).get("user_request") or "").strip()
-    except Exception:
-        return None
-    if prev_demand != str(demand or "").strip():
-        return None
-
-    # step2 output must exist and be structurally valid.
-    s2_path = prev / "step2_output.json"
-    if not s2_path.exists():
-        return None
-    try:
-        step2_output = read_json(s2_path)
-    except Exception:
-        return None
-    if not _step2_output_is_valid(step2_output):
-        return None
-
-    # Beautify stage must have completed (either produced an image or was a
-    # legitimate no-op). Otherwise we let it run normally.
-    bi_path = prev / "beautify_image_result.json"
-    if not bi_path.exists():
-        return None
-    try:
-        bi = read_json(bi_path) or {}
-    except Exception:
-        return None
-
-    ref_image_path = ""
-    if bi.get("ok") is True:
-        ref = paths.beautify_reference_png(page_num)
-        if ref.exists():
-            ref_image_path = str(ref)
-        else:
-            # ok but the image is gone: fall back to regenerating.
-            return None
-    elif not (bi.get("skipped") is True or bi.get("ok") is False):
-        # Unknown/partial beautify state: don't trust it.
-        return None
-    # (skipped / ok:false both mean step3 would run without a reference image;
-    #  reusing step2 alone is still a win.)
-
-    return {
-        "step2_output": step2_output,
-        "beautify_reference_image_path": ref_image_path,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +265,6 @@ def node_step2(state: PipelineState) -> PipelineState:
         )
 
     _emit_progress(state, "plan")
-    resumed = state.get("resumed_step2_output")
     turn_dir = Path(state["turn_dir"])
     if not isinstance(state.get("current_page_state"), dict):
         raise RuntimeError("node_step2: missing shared page understanding core")
@@ -370,15 +278,6 @@ def node_step2(state: PipelineState) -> PipelineState:
         },
     )
     write_json(turn_dir / "html_lineage_candidate.json", state.get("html_lineage_candidate") or {})
-
-    if isinstance(resumed, dict) and resumed:
-        # Reuse the previous turn's valid step2 output (resume-from-step3).
-        write_json(turn_dir / "step2_output.json", resumed)
-        write_json(
-            turn_dir / "step2_resume.json",
-            {"resumed": True, "reason": "prev_turn_died_at_step3"},
-        )
-        return {"step2_output": resumed}
 
     out = run_step2(
         user_request=demand,
@@ -576,7 +475,7 @@ def node_step3(state: PipelineState) -> PipelineState:
         previous_html=previous_html,
     )
     visual_check = result.get("visual_self_check") or {}
-    if visual_check.get("status") in {"failed", "unavailable"}:
+    if visual_check.get("status") == "failed" and visual_check.get("retryable") is False:
         raise RuntimeError("step3 visual self-check did not produce an acceptable page")
     if visual_check.get("verdict") == "revise" and not visual_check.get("repair_applied"):
         raise RuntimeError("step3 visual self-check found an unrepaired major issue")
@@ -585,7 +484,6 @@ def node_step3(state: PipelineState) -> PipelineState:
         "prep_warnings": result.get("prep_warnings") or [],
         "soft_warnings": result.get("soft_warnings") or [],
         "has_layout_intent": bool(result.get("has_layout_intent")),
-        "used_beautify_reference": bool(result.get("used_beautify_reference")),
         "visual_self_check": result.get("visual_self_check") or {},
     })
     # Save the rendered page_block alongside the turn for quick inspection.
@@ -728,8 +626,9 @@ def commit_turn_html_to_pptist(
         raise RuntimeError("commit: no final HTML found for this turn")
 
     bundle_dir = Path((step3_result or {}).get("bundle_dir") or html_path.parent)
-    render_html = Path((step3_result or {}).get("index_html") or "")
-    if not render_html.exists():
+    index_html_value = str((step3_result or {}).get("index_html") or "").strip()
+    render_html = Path(index_html_value) if index_html_value else Path()
+    if not render_html.is_file():
         render_html = html_path
 
     doc = convert_html(render_html, title=str(title or "PPTAgent"), assets_dir=bundle_dir)

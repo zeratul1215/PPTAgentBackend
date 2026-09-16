@@ -25,7 +25,7 @@ from agent_backend.agent.tools.context import (
     workspace_for,
 )
 from agent_backend.agent.tools.deck_style import public_style_row, require_ready_style
-from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.graph import (
+from agent_backend.agent.tools.pipeline_without_reference_image.edit_graph import (
     commit_turn_html_to_pptist,
 )
 from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.steps import (
@@ -159,7 +159,7 @@ def _pending_assets_for_run(paths, slot: int, run_id: str) -> tuple[list[dict[st
                 "path": str(path),
                 "original_filename": str(item.get("original_filename") or Path(filename).name),
                 "user_note": str(item.get("user_note") or ""),
-                "artifact_ref": str(item.get("artifact_ref") or ""),
+                "resource_ref": str(item.get("resource_ref") or item.get("artifact_ref") or ""),
                 "width": w,
                 "height": h,
             }
@@ -578,7 +578,7 @@ def fill_empty_pages(fills: list[PageFill], runtime: ToolRuntime) -> dict[str, A
                 mode="create",
             )
             visual_check = step3_result.get("visual_self_check") or {}
-            if visual_check.get("status") in {"failed", "unavailable"}:
+            if visual_check.get("status") == "failed" and visual_check.get("retryable") is False:
                 raise RuntimeError("step3 visual self-check did not produce an acceptable page")
             if visual_check.get("verdict") == "revise" and not visual_check.get("repair_applied"):
                 raise RuntimeError("step3 visual self-check found an unrepaired major issue")
@@ -589,7 +589,6 @@ def fill_empty_pages(fills: list[PageFill], runtime: ToolRuntime) -> dict[str, A
                     "prep_warnings": step3_result.get("prep_warnings") or [],
                     "soft_warnings": step3_result.get("soft_warnings") or [],
                     "has_layout_intent": bool(step3_result.get("has_layout_intent")),
-                    "used_beautify_reference": bool(step3_result.get("used_beautify_reference")),
                     "visual_self_check": step3_result.get("visual_self_check") or {},
                 },
             )

@@ -6,8 +6,9 @@ Two independent stores hold state that survives a restart:
    * application tables: ``users`` / ``decks`` / ``sessions`` /
      ``session_decks`` / ``turns`` / ``deck_styles`` /
      ``deck_style_presets`` / ``chat_messages`` / ``agent_runs`` /
-     ``conversation_summaries`` / ``session_states`` / ``artifacts``
-     (see ``workspace/schema.sql``).
+     ``conversation_summaries`` / ``session_states`` /
+     ``session_resources`` / ``session_resource_files`` /
+     ``session_resource_mentions`` (see ``workspace/schema.sql``).
    * LangGraph checkpoint tables owned by ``PostgresSaver``
      (``checkpoints`` / ``checkpoint_writes`` / ``checkpoint_blobs`` /
      ``checkpoint_migrations``) — these hold the multi-turn chat memory.
@@ -47,7 +48,7 @@ import sys
 
 from agent_backend.workspace.db import database_url, get_pool
 from agent_backend.workspace.env import load_dotenv
-from agent_backend.workspace.paths import DEFAULT_RESULTS_ROOT, PROJECT_ROOT
+from agent_backend.workspace.paths import DEFAULT_RESULTS_ROOT, DEFAULT_SESSION_RESOURCES_ROOT
 
 # Load agent_backend/.env so PPT_DATABASE_URL etc. are available even when the
 # process was started without exporting them by hand.
@@ -59,7 +60,9 @@ load_dotenv()
 _APP_TABLES = (
     "agent_run_events",
     "agent_runs",
-    "artifacts",
+    "session_resource_mentions",
+    "session_resource_files",
+    "session_resources",
     "session_states",
     "conversation_summaries",
     "chat_messages",
@@ -71,7 +74,6 @@ _APP_TABLES = (
     "decks",
     "users",
 )
-_ARTIFACTS_ROOT = PROJECT_ROOT / "artifacts"
 
 # LangGraph PostgresSaver's tables. It recreates them on the next .setup(), so
 # truncating (or dropping) them just clears the chat memory.
@@ -147,14 +149,14 @@ def reset_files(*, dry_run: bool) -> None:
         shutil.rmtree(p, ignore_errors=True)
     print(f"[reset] deleted {len(projects)} workspace(s).")
 
-    artifact_root = _ARTIFACTS_ROOT
-    if artifact_root.exists():
-        print(f"[reset] artifacts under {artifact_root}")
+    resource_root = DEFAULT_SESSION_RESOURCES_ROOT
+    if resource_root.exists():
+        print(f"[reset] session resources under {resource_root}")
         if dry_run:
-            print("[reset] dry-run: artifact files preserved.")
+            print("[reset] dry-run: session resources preserved.")
         else:
-            shutil.rmtree(artifact_root, ignore_errors=True)
-            print("[reset] deleted artifact root.")
+            shutil.rmtree(resource_root, ignore_errors=True)
+            print("[reset] deleted session resource root.")
 
 
 def _confirm(prompt: str) -> bool:
@@ -183,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     if do_db:
         targets.append("Postgres data (users/decks/sessions/turns/deck styles/style templates + chat checkpoints)")
     if do_files:
-        targets.append(f"on-disk workspaces under {DEFAULT_RESULTS_ROOT} and artifacts under {_ARTIFACTS_ROOT}")
+        targets.append(f"on-disk workspaces under {DEFAULT_RESULTS_ROOT} and session resources under {DEFAULT_SESSION_RESOURCES_ROOT}")
     print("[reset] this will permanently delete:")
     for t in targets:
         print(f"[reset]   * {t}")

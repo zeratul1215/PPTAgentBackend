@@ -269,7 +269,7 @@ def create_chat_run(
     active_project_id: str | None,
     selected_slot: int | None,
     page_order_revision: int | None,
-    artifact_refs: list[str],
+    resource_refs: list[str],
 ) -> dict[str, Any]:
     pool = get_pool()
     if pool is None:
@@ -277,7 +277,7 @@ def create_chat_run(
     user_message_id = uuid.uuid4().hex
     assistant_message_id = uuid.uuid4().hex
     agent_run_id = f"run_{uuid.uuid4().hex[:12]}"
-    attachments_json = json.dumps([{"artifact_ref": r} for r in artifact_refs], ensure_ascii=False)
+    attachments_json = json.dumps([{"resource_ref": r} for r in resource_refs], ensure_ascii=False)
     with pool.connection() as conn:
         existing = conn.execute(
             """
@@ -360,15 +360,25 @@ def create_chat_run(
                 page_order_revision,
             ),
         ).fetchone()
-        if artifact_refs:
+        if resource_refs:
             conn.execute(
                 """
-                UPDATE artifacts
-                SET message_id = %s, status = 'attached', updated_at = now()
-                WHERE session_id = %s AND user_id = %s AND artifact_ref = ANY(%s)
+                UPDATE session_resources
+                SET created_message_id = %s, status = CASE WHEN status = 'draft' THEN 'ready' ELSE status END,
+                    last_mentioned_seq = (SELECT seq FROM chat_messages WHERE message_id = %s),
+                    updated_at = now()
+                WHERE session_id = %s AND user_id = %s AND resource_ref = ANY(%s)
                 """,
-                (user_message_id, session_id, user_id, artifact_refs),
+                (user_message_id, user_message_id, session_id, user_id, resource_refs),
             )
+            with conn.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO session_resource_mentions(resource_ref, message_id, relation)
+                    VALUES (%s, %s, 'uploaded')
+                    """,
+                    [(ref, user_message_id) for ref in resource_refs],
+                )
         conn.execute(
             "UPDATE sessions SET last_active_at = now() WHERE session_id = %s",
             (session_id,),
@@ -829,6 +839,467 @@ def cleanup_draft_artifacts(*, older_than_hours: int = 24) -> list[str]:
     return paths
 
 
+# ---------------------------------------------------------------------------
+# Session Resource Context
+# ---------------------------------------------------------------------------
+
+
+def create_session_resource(
+    *,
+    resource_ref: str,
+    session_id: str,
+    user_id: str,
+    kind: str,
+    source_kind: str,
+    description: str,
+    description_status: str,
+    status: str,
+    content_hash: str,
+    source_locator: dict[str, Any] | None = None,
+    created_message_id: str | None = None,
+    created_run_id: str | None = None,
+    created_seq: int | None = None,
+    files: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    pool = get_pool()
+    if pool is None:
+        raise RuntimeError("session resources require a database")
+    ensure_user(user_id)
+    with pool.connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO session_resources (
+                resource_ref, session_id, user_id, kind, source_kind,
+                description, description_status, status, content_hash,
+                source_locator, created_message_id, created_run_id, created_seq,
+                last_mentioned_seq, last_used_seq
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                    %s, %s, %s, %s, %s)
+            RETURNING *
+            """,
+            (
+                resource_ref, session_id, user_id, kind, source_kind,
+                description or "", description_status, status, content_hash,
+                json.dumps(source_locator or {}, ensure_ascii=False),
+                created_message_id, created_run_id, created_seq,
+                created_seq, created_seq,
+            ),
+        ).fetchone()
+        for item in files or []:
+            conn.execute(
+                """
+                INSERT INTO session_resource_files (
+                    resource_ref, role, relative_path, mime_type, byte_size,
+                    sha256, width, height
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    resource_ref, item["role"], item["relative_path"],
+                    item.get("mime_type") or "application/octet-stream",
+                    int(item.get("byte_size") or 0), item.get("sha256") or "",
+                    item.get("width"), item.get("height"),
+                ),
+            )
+    return dict(row)
+
+
+def get_session_resource(*, resource_ref: str, session_id: str, user_id: str) -> Optional[dict[str, Any]]:
+    pool = get_pool()
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        row = conn.execute(
+            """
+            SELECT r.*, COALESCE(jsonb_agg(to_jsonb(f)) FILTER (WHERE f.role IS NOT NULL), '[]'::jsonb) AS files
+            FROM session_resources r
+            LEFT JOIN session_resource_files f ON f.resource_ref = r.resource_ref
+            WHERE r.resource_ref = %s AND r.session_id = %s AND r.user_id = %s
+            GROUP BY r.resource_ref
+            """,
+            (resource_ref, session_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_message_seq(*, message_id: str, session_id: str, user_id: str) -> int | None:
+    """Resolve a product message id to its session-local sequence number."""
+    pool = get_pool()
+    if pool is None or not message_id:
+        return None
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT seq FROM chat_messages WHERE message_id = %s AND session_id = %s AND user_id = %s",
+            (message_id, session_id, user_id),
+        ).fetchone()
+    return int(row["seq"]) if row and row.get("seq") is not None else None
+
+
+def get_chat_message_content(*, message_id: str, session_id: str, user_id: str) -> str:
+    """Return a bounded product message body for resource provenance."""
+    pool = get_pool()
+    if pool is None or not message_id:
+        return ""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT content FROM chat_messages WHERE message_id = %s AND session_id = %s AND user_id = %s",
+            (message_id, session_id, user_id),
+        ).fetchone()
+    return str(row["content"] or "")[:1000] if row else ""
+
+
+def find_session_resource_by_source(*, session_id: str, user_id: str, kind: str, content_hash: str, source_locator: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Find an immutable capture that represents the same source snapshot."""
+    pool = get_pool()
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM session_resources
+            WHERE session_id = %s AND user_id = %s AND kind = %s
+              AND content_hash = %s AND status <> 'deleted'
+              AND source_locator @> %s::jsonb
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (session_id, user_id, kind, content_hash, json.dumps(source_locator or {}, ensure_ascii=False)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def find_session_resource_by_content(*, session_id: str, user_id: str, kind: str, content_hash: str) -> Optional[dict[str, Any]]:
+    """Find an active resource with the same canonical payload.
+
+    The fallback against the original file hash also recognizes resources
+    created before preview bytes were excluded from content identity.
+    """
+    pool = get_pool()
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        row = conn.execute(
+            """
+            SELECT r.*
+            FROM session_resources r
+            LEFT JOIN session_resource_files f
+              ON f.resource_ref = r.resource_ref AND f.role = 'original'
+            WHERE r.session_id = %s AND r.user_id = %s AND r.kind = %s
+              AND r.status <> 'deleted'
+              AND (r.content_hash = %s OR f.sha256 = %s)
+            ORDER BY r.created_at ASC
+            LIMIT 1
+            """,
+            (session_id, user_id, kind, content_hash, content_hash),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_session_resource_capture(*, resource_ref: str, session_id: str, user_id: str, source_locator: dict[str, Any], source_kind: str | None = None) -> bool:
+    pool = get_pool()
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE session_resources
+            SET source_locator = %s::jsonb,
+                source_kind = COALESCE(%s, source_kind),
+                updated_at = now()
+            WHERE resource_ref = %s AND session_id = %s AND user_id = %s AND status <> 'deleted'
+            """,
+            (json.dumps(source_locator or {}, ensure_ascii=False), source_kind, resource_ref, session_id, user_id),
+        )
+    return bool(cur.rowcount)
+
+
+def list_session_resources(
+    *, session_id: str, user_id: str, limit: int = 10, include_deleted: bool = False
+) -> list[dict[str, Any]]:
+    pool = get_pool()
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, COALESCE(jsonb_agg(to_jsonb(f)) FILTER (WHERE f.role IS NOT NULL), '[]'::jsonb) AS files
+            FROM session_resources r
+            LEFT JOIN session_resource_files f ON f.resource_ref = r.resource_ref
+            WHERE r.session_id = %s AND r.user_id = %s
+              AND (%s OR r.status <> 'deleted')
+            GROUP BY r.resource_ref
+            ORDER BY COALESCE(r.last_mentioned_seq, 0) DESC,
+                     COALESCE(r.last_used_seq, 0) DESC, r.created_at DESC
+            LIMIT %s
+            """,
+            (session_id, user_id, include_deleted, max(1, min(int(limit), 100))),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_recent_session_resources(*, session_id: str, user_id: str, limit: int = 10, completed_turns: int = 8) -> list[dict[str, Any]]:
+    """Return resources mentioned or used in the most recent completed turns."""
+    pool = get_pool()
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            WITH recent_turns AS (
+                SELECT m.seq
+                FROM agent_runs ar
+                JOIN chat_messages m ON m.message_id = ar.user_message_id
+                WHERE ar.session_id = %s AND ar.user_id = %s
+                  AND ar.status IN ('complete', 'failed', 'cancelled')
+                ORDER BY ar.completed_at DESC NULLS LAST, ar.created_at DESC
+                LIMIT %s
+            ), cutoff AS (
+                SELECT COALESCE(MIN(seq), 0) AS seq FROM recent_turns
+            )
+            SELECT r.*, MAX(m.message_seq) AS recent_message_seq
+            FROM session_resources r
+            JOIN session_resource_mentions m ON m.resource_ref = r.resource_ref
+            CROSS JOIN cutoff c
+            WHERE r.session_id = %s AND r.user_id = %s AND r.status <> 'deleted'
+              AND COALESCE(m.message_seq, 0) >= c.seq
+            GROUP BY r.resource_ref
+            ORDER BY MAX(m.message_seq) DESC NULLS LAST,
+                     COALESCE(r.last_used_seq, 0) DESC, r.created_at DESC
+            LIMIT %s
+            """,
+            (session_id, user_id, max(1, int(completed_turns)), session_id, user_id, max(1, min(int(limit), 10))),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_recent_session_resources(*, session_id: str, user_id: str, current_message_id: str | None = None, turns_back: int = 1, kinds: list[str] | None = None) -> list[dict[str, Any]]:
+    """Return resources mentioned by the previous completed conversation turns."""
+    pool = get_pool()
+    if pool is None:
+        return []
+    turns = max(1, min(int(turns_back), 8))
+    allowed_kinds = [str(k) for k in (kinds or []) if str(k) in {"image", "table", "page", "file"}]
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            WITH current_message AS (
+                SELECT seq FROM chat_messages WHERE message_id = %s AND session_id = %s AND user_id = %s
+            ), prior_runs AS (
+                SELECT ar.agent_run_id, um.seq,
+                       row_number() OVER (ORDER BY um.seq DESC) AS turn_offset
+                FROM agent_runs ar
+                JOIN chat_messages um ON um.message_id = ar.user_message_id
+                WHERE ar.session_id = %s AND ar.user_id = %s
+                  AND ar.status IN ('complete', 'failed', 'cancelled')
+                  AND (%s::text IS NULL OR um.seq < COALESCE((SELECT seq FROM current_message), 9223372036854775807))
+                ORDER BY um.seq DESC
+                LIMIT %s
+            )
+            SELECT r.resource_ref, r.kind, r.description, r.description_status,
+                   MIN(pr.turn_offset) AS turn_offset,
+                   jsonb_agg(jsonb_build_object(
+                       'relation', m.relation,
+                       'message_id', m.message_id,
+                       'agent_run_id', m.agent_run_id,
+                       'message_seq', m.message_seq,
+                       'details', m.details
+                   ) ORDER BY m.created_at DESC) AS mentions
+            FROM prior_runs pr
+            JOIN session_resource_mentions m ON m.agent_run_id = pr.agent_run_id
+            JOIN session_resources r ON r.resource_ref = m.resource_ref
+            WHERE r.session_id = %s AND r.user_id = %s AND r.status <> 'deleted'
+              AND (cardinality(%s::text[]) = 0 OR r.kind = ANY(%s::text[]))
+            GROUP BY r.resource_ref, r.kind, r.description, r.description_status
+            ORDER BY MIN(pr.turn_offset), MAX(m.created_at) DESC
+            LIMIT 5
+            """,
+            (current_message_id, session_id, user_id, session_id, user_id, current_message_id, turns, session_id, user_id, allowed_kinds, allowed_kinds),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_session_resources_for_message(*, message_id: str, session_id: str, user_id: str) -> list[dict[str, Any]]:
+    pool = get_pool()
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, f.relative_path AS resource_filename,
+                   f.mime_type AS resource_mime, f.byte_size AS resource_bytes,
+                   f.width AS resource_width, f.height AS resource_height
+            FROM session_resources r
+            JOIN session_resource_mentions m ON m.resource_ref = r.resource_ref
+            LEFT JOIN session_resource_files f ON f.resource_ref = r.resource_ref AND f.role = 'original'
+            WHERE m.message_id = %s AND r.session_id = %s AND r.user_id = %s
+              AND r.status <> 'deleted'
+            ORDER BY m.created_at ASC
+            """,
+            (message_id, session_id, user_id),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def attach_session_resources_to_message(*, resource_refs: list[str], message_id: str, session_id: str, user_id: str, message_seq: int | None = None) -> None:
+    pool = get_pool()
+    if pool is None or not resource_refs:
+        return
+    with pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE session_resources
+            SET status = CASE WHEN status = 'draft' THEN 'ready' ELSE status END,
+                last_mentioned_seq = COALESCE(%s, last_mentioned_seq),
+                updated_at = now()
+            WHERE session_id = %s AND user_id = %s AND resource_ref = ANY(%s)
+            """,
+            (message_seq, session_id, user_id, resource_refs),
+        )
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO session_resource_mentions(resource_ref, message_id, relation, message_seq)
+                VALUES (%s, %s, 'uploaded', %s)
+                """,
+                [(ref, message_id, message_seq) for ref in resource_refs],
+            )
+
+
+def touch_session_resources(*, resource_refs: list[str], session_id: str, user_id: str, message_seq: int | None = None, relation: str = "used", message_id: str | None = None, agent_run_id: str | None = None, details: dict[str, Any] | None = None) -> None:
+    pool = get_pool()
+    if pool is None or not resource_refs:
+        return
+    mentioned = relation in {"uploaded", "mentioned"}
+    used = relation in {"captured", "inspect", "staged", "used"}
+    with pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE session_resources
+            SET last_mentioned_seq = CASE WHEN %s THEN COALESCE(%s, last_mentioned_seq) ELSE last_mentioned_seq END,
+                last_used_seq = CASE WHEN %s THEN COALESCE(%s, last_used_seq) ELSE last_used_seq END,
+                updated_at = now()
+            WHERE session_id = %s AND user_id = %s AND resource_ref = ANY(%s) AND status <> 'deleted'
+            """,
+            (mentioned, message_seq, used, message_seq, session_id, user_id, resource_refs),
+        )
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO session_resource_mentions(resource_ref, message_id, agent_run_id, relation, message_seq, details)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                [(ref, message_id, agent_run_id, relation, message_seq, json.dumps(details or {}, ensure_ascii=False)) for ref in resource_refs],
+            )
+
+
+def update_session_resource_description(*, resource_ref: str, session_id: str, user_id: str, description: str, status: str = "ready") -> bool:
+    pool = get_pool()
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE session_resources
+            SET description = %s, description_status = %s, updated_at = now()
+            WHERE resource_ref = %s AND session_id = %s AND user_id = %s AND status <> 'deleted'
+            """,
+            (description or "", status, resource_ref, session_id, user_id),
+        )
+    return bool(cur.rowcount)
+
+
+def update_session_resource_embedding(*, resource_ref: str, session_id: str, user_id: str, embedding: list[float], model: str) -> bool:
+    pool = get_pool()
+    if pool is None:
+        return False
+    value = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+    with pool.connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE session_resources
+            SET embedding = %s::vector, embedding_model = %s, updated_at = now()
+            WHERE resource_ref = %s AND session_id = %s AND user_id = %s AND status <> 'deleted'
+            """,
+            (value, model, resource_ref, session_id, user_id),
+        )
+    return bool(cur.rowcount)
+
+
+def search_session_resources(*, session_id: str, user_id: str, embedding: list[float], embedding_model: str, kinds: list[str] | None = None) -> list[dict[str, Any]]:
+    pool = get_pool()
+    if pool is None:
+        return []
+    value = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+    allowed_kinds = [str(k) for k in (kinds or []) if str(k) in {"image", "table", "page", "file"}]
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.resource_ref, r.kind, r.source_kind, r.description,
+                   r.description_status, r.last_mentioned_seq, r.last_used_seq,
+                   1 - (r.embedding <=> %s::vector) AS similarity
+            FROM session_resources r
+            WHERE r.session_id = %s AND r.user_id = %s AND r.status = 'ready'
+              AND r.description_status = 'ready' AND r.embedding_model = %s
+              AND r.embedding IS NOT NULL
+              AND (cardinality(%s::text[]) = 0 OR r.kind = ANY(%s::text[]))
+            ORDER BY r.embedding <=> %s::vector,
+                     COALESCE(r.last_mentioned_seq, 0) DESC
+            LIMIT 5
+            """,
+            (value, session_id, user_id, embedding_model, allowed_kinds, allowed_kinds, value),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_session_resource_deleted(*, resource_ref: str, session_id: str, user_id: str) -> bool:
+    pool = get_pool()
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE session_resources
+            SET status = 'deleted', deleted_at = now(), updated_at = now()
+            WHERE resource_ref = %s AND session_id = %s AND user_id = %s AND status <> 'deleted'
+            """,
+            (resource_ref, session_id, user_id),
+        )
+    return bool(cur.rowcount)
+
+
+def cleanup_draft_session_resources(*, older_than_hours: int = 24) -> list[dict[str, str]]:
+    """Soft-delete unbound draft resources and return their owner identifiers."""
+    pool = get_pool()
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            UPDATE session_resources
+            SET status = 'deleted', deleted_at = now(), updated_at = now()
+            WHERE status = 'draft' AND created_at < now() - (%s || ' hours')::interval
+            RETURNING resource_ref, session_id, user_id
+            """,
+            (int(older_than_hours),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_session_resource_files(resource_ref: str, session_id: str, user_id: str) -> list[dict[str, Any]]:
+    pool = get_pool()
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT f.* FROM session_resource_files f
+            JOIN session_resources r ON r.resource_ref = f.resource_ref
+            WHERE f.resource_ref = %s AND r.session_id = %s AND r.user_id = %s AND r.status <> 'deleted'
+            """,
+            (resource_ref, session_id, user_id),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def mark_stale_running_runs_failed() -> None:
     pool = get_pool()
     if pool is None:
@@ -1079,15 +1550,11 @@ __all__ = [
     "list_agent_events",
     "append_assistant_message",
     "list_chat_messages",
+    "get_chat_message_content",
     "get_conversation_summary",
     "get_session_state",
     "upsert_conversation_summary",
     "commit_context_compaction",
-    "create_artifact",
-    "get_artifact",
-    "list_artifacts_for_message",
-    "mark_artifact_deleted",
-    "cleanup_draft_artifacts",
     "mark_stale_running_runs_failed",
     "record_turn",
     "get_deck_style",

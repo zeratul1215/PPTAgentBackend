@@ -285,6 +285,7 @@ class ContextAssembler:
     project_summary_loader: Any
     position_loader: Any
     artifact_text_loader: Any
+    resource_context_loader: Any | None = None
 
     def prepare(self) -> list[dict[str, str]]:
         self._sync_fallback_if_needed()
@@ -365,7 +366,13 @@ class ContextAssembler:
         artifact_text = self.artifact_text_loader(user_message_id)
         if artifact_text:
             content_parts.append(artifact_text)
+        if self.resource_context_loader is not None:
+            try:
+                resource_text = self.resource_context_loader(self.session_id, user_message_id)
+            except Exception:
+                resource_text = ""
+            if resource_text:
+                content_parts.append(resource_text)
         content_parts.append("User request:\n" + current_text)
         assembled.append({"role": "user", "content": "\n\n".join(content_parts)})
         return assembled
-

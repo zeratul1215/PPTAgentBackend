@@ -35,7 +35,7 @@ def convert(html_path: str | Path, title: str | None = None,
     html_path = Path(html_path).resolve()
     pages = measure_html(html_path)
     if not pages:
-        raise SystemExit(f"No .page / .baseline-page found in {html_path}")
+        raise RuntimeError(f"No .page / .baseline-page found in {html_path}")
     base_dir = Path(assets_dir).resolve() if assets_dir else html_path.parent
     doc = build_pptist(pages, base_dir=base_dir, title=title or html_path.stem)
     # Bake standalone text boxes to the height PPTist actually renders.

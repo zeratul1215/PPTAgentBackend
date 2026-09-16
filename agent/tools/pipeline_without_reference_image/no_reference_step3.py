@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -13,6 +14,34 @@ from agent_backend.agent.tools.heavy_tool_impl.single_page_edition import steps
 from agent_backend.agent.tools.heavy_tool_impl.single_page_edition.step_3_reassemble import (
     step3_reassemble_mvp as s3,
 )
+
+
+def _normalize_visual_self_check(value: Any) -> dict[str, Any]:
+    """Normalize the current visual-critic contract conservatively."""
+    if not isinstance(value, dict):
+        return {"status": "unavailable", "verdict": "unavailable", "severity": "none", "issues": []}
+    result = dict(value)
+    if not isinstance(result.get("issues"), list):
+        return {"status": "unavailable", "verdict": "unavailable", "severity": "none", "issues": []}
+    issues = result["issues"]
+    verdict = str(result.get("verdict") or "").strip().lower()
+    severity = str(result.get("severity") or "").strip().lower()
+    nested = [str(item.get("severity") or "").strip().lower() for item in issues if isinstance(item, dict)]
+    if not severity:
+        severity = "major" if any(item in {"critical", "high", "major"} for item in nested) else ("minor" if any(item in {"minor", "low"} for item in nested) else "none")
+    if severity in {"critical", "high"}:
+        severity = "major"
+    if verdict == "pass" and severity == "major":
+        verdict = "revise"
+    if verdict not in {"pass", "revise"}:
+        verdict = "unavailable"
+    result.update({"verdict": verdict, "severity": severity, "issues": issues})
+    result["status"] = "unavailable" if verdict == "unavailable" else ("passed" if verdict == "pass" else "needs_revision")
+    return result
+
+
+def _disabled_visual_self_check() -> dict[str, Any]:
+    return {"status": "skipped", "reason": "disabled_by_config", "verdict": "not_run", "severity": "none", "repair_applied": False}
 
 
 def _system_prompt(mode: str) -> str:
@@ -83,6 +112,7 @@ Existing-page mode:
 - Never OCR the original image. Final text and content images come from the
   PageSpec only.
 """
+    prompt = prompt.replace("reference_image", "design_brief").replace("reference image", "design brief")
     return prompt.rstrip() + "\n\n" + mode_text.strip() + "\n"
 
 
@@ -97,6 +127,12 @@ def _user_prompt(
     vi = step2.get("visual_intent") if isinstance(step2.get("visual_intent"), dict) else {}
     visual = str(vi.get("requirements_text") or "").strip()
     strategy = step2.get("reassembly_strategy") if isinstance(step2.get("reassembly_strategy"), dict) else {}
+    compile_obj = step2.get("compile") if isinstance(step2.get("compile"), dict) else {}
+    table_render_context = (
+        step2.get("table_render_context")
+        if isinstance(step2.get("table_render_context"), dict)
+        else (compile_obj.get("table_render_context") if isinstance(compile_obj.get("table_render_context"), dict) else {})
+    )
     if mode == "create":
         brief = visual or user_request
     else:
@@ -122,6 +158,8 @@ def _user_prompt(
         + brief
         + "\n\nreassembly_strategy:\n"
         + json.dumps(strategy, ensure_ascii=False)
+        + "\n\ntable_render_context (internal rendering guidance; not page content):\n"
+        + json.dumps(table_render_context, ensure_ascii=False)
         + "\n\nfull_user_request:\n"
         + user_request
         + notes
@@ -314,6 +352,20 @@ def run_step3_without_reference(
     chunk, index = _write_runtime(step2=step2_output, page_block=page_block, paths=paths, page_num=page_num, turn_dir=turn_dir)
     current_png = turn_dir / "step3_visual_current.png"
     _render(index, current_png)
+    enabled = os.environ.get("PPT_STEP3_VISUAL_SELF_CHECK", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        check = _disabled_visual_self_check()
+        write_json(turn_dir / "step3_visual_check.json", check)
+        return {
+            "chunk_path": str(chunk),
+            "bundle_dir": str(index.parent),
+            "index_html": str(index),
+            "page_state": page_state,
+            "has_layout_intent": bool(step2_output.get("visual_intent")),
+            "visual_self_check": check,
+            "prep_warnings": debug.get("soft_warnings") or [],
+            "soft_warnings": debug.get("soft_warnings") or [],
+        }
     compare_path: Path | None = None
     critic_image = current_png
     if original_page_png and original_page_png.exists():
@@ -325,29 +377,24 @@ def run_step3_without_reference(
     if dry_run:
         critic = {"verdict": "pass", "severity": "none", "issues": [], "status": "dry_run"}
     else:
-        base_url, api_key = steps._resolve_llm_backend()
-        raw = s3._openai_chat_completion(
-            base_url=base_url, api_key=api_key, model=model,
-            system_prompt=_CRITIC_SYSTEM_PROMPT, user_text=prompt,
-            image_bytes=critic_image.read_bytes(), max_tokens=1800,
-            temperature=0.0, retries=1, retry_base_seconds=1.0,
-            retry_max_seconds=8.0, retry_backoff=2.0,
-            tag="step3.without_reference.visual_critic",
-        )
-        write_text(turn_dir / "step3_visual_check_raw.txt", raw or "")
         try:
+            base_url, api_key = steps._resolve_llm_backend()
+            raw = s3._openai_chat_completion(
+                base_url=base_url, api_key=api_key, model=model,
+                system_prompt=_CRITIC_SYSTEM_PROMPT, user_text=prompt,
+                image_bytes=critic_image.read_bytes(), max_tokens=1800,
+                temperature=0.0, retries=1, retry_base_seconds=1.0,
+                retry_max_seconds=8.0, retry_backoff=2.0,
+                tag="step3.without_reference.visual_critic",
+            )
+            write_text(turn_dir / "step3_visual_check_raw.txt", raw or "")
             critic = json.loads(re.sub(r"^```json\s*|\s*```$", "", (raw or "").strip(), flags=re.I))
-        except Exception:
-            critic = {"verdict": "unavailable", "severity": "major", "issues": [], "status": "unavailable"}
-    if not isinstance(critic, dict):
-        critic = {"verdict": "unavailable", "severity": "major", "issues": [], "status": "unavailable"}
-    verdict = str(critic.get("verdict") or "").strip().lower()
-    severity = str(critic.get("severity") or "").strip().lower()
-    if verdict in {"fail", "failed"}:
-        verdict = "revise"
-    if severity in {"critical", "high"}:
-        severity = "major"
-    critic["verdict"], critic["severity"] = verdict, severity
+        except Exception as exc:
+            write_text(turn_dir / "step3_visual_check_error.txt", f"{type(exc).__name__}: {exc}")
+            critic = {"verdict": "unavailable", "severity": "none", "issues": [], "status": "unavailable"}
+    critic = _normalize_visual_self_check(critic)
+    verdict = critic.get("verdict")
+    severity = critic.get("severity")
     write_json(turn_dir / "step3_visual_check.json", critic)
     repaired = False
     if critic.get("verdict") == "revise" and critic.get("severity") == "major" and not dry_run:
@@ -371,17 +418,19 @@ def run_step3_without_reference(
                 page_block = candidate
                 _write_runtime(step2=step2_output, page_block=page_block, paths=paths, page_num=page_num, turn_dir=turn_dir)
                 repaired = True
+    final_status = "repaired" if repaired else ("passed" if verdict == "pass" else ("unavailable" if verdict == "unavailable" else "failed"))
     return {
         "page_block": page_block,
         "chunk_path": str(chunk),
         "bundle_dir": str(turn_dir / "html_runtime"),
         "index_html": str(index),
         "has_layout_intent": bool(s3._has_layout_intent(step2_output)),
-        "used_beautify_reference": False,
+        "retryable": False if final_status == "failed" else True,
         "visual_self_check": {
-            "status": "repaired" if repaired else ("passed" if verdict == "pass" else "failed"),
+            "status": final_status,
             "repair_applied": repaired,
             "verdict": verdict,
             "severity": severity,
+            "retryable": False if final_status == "failed" else True,
         },
     }

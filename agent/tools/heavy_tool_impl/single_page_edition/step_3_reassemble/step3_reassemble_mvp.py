@@ -192,10 +192,8 @@ Hard constraints (MUST follow — these are the ONLY styling limits):
   - Put a text's `data-ref` on the BLOCK/FLEX/GRID container whose full rendered border box should become the editable
     PPTist text box. Never put it only on an inner inline `<span>` or another shrink-wrapped styling child. Inner spans
     may carry font/color emphasis, but the outer `data-ref` container owns width, padding, wrapping, and alignment.
-  - THE ONLY EXCEPTION is a DECLARED `page_state.tables[]` column (see the table rules below): when a text node is a
-    column of a declared `<table>`, its `data-ref="tN"` is placed on that text's cell in EVERY row, so it repeats once
-    per row. This is allowed ONLY when every occurrence of that id is a `<td>`/`<th>` inside the same `<table>`. Outside
-    that case, never repeat a `data-ref`.
+  - Tables use the table id once on `<table>` and cell ids on visible `<td>`/`<th>` elements. Never reuse a text
+    `data-ref` for table cells.
   - Do NOT use any `data-ref` values outside `page_state.required_refs.all`. Do NOT put the same `data-ref` twice on the
     same element.
 - Space-first sizing (IMPORTANT): shrinking the font is the LAST resort, NOT the first move. Text should fill the space it
@@ -1002,31 +1000,6 @@ def _check_positioning(*, page_block: str) -> list[str]:
     return hard
 
 
-_TABLE_RE = re.compile(r"(?is)<table\b[^>]*>.*?</table>")
-_CELL_RE = re.compile(r"(?is)<(?:td|th)\b[^>]*\bdata-ref\s*=\s*\"([^\"]+)\"[^>]*>")
-
-
-def _is_table_column_ref(page_block: str, ref: str) -> bool:
-    """A repeated `data-ref` is legal ONLY when it marks one column of a single
-    <table>: every one of its occurrences sits on a <td>/<th> cell, and all of
-    those cells belong to the SAME <table>. This is how two text nodes are
-    aligned row-by-row inside one table (each column = one data-ref, repeated
-    once per row). Returns True when `ref` satisfies that; False otherwise
-    (cross-table repetition, occurrences on non-cell elements, or a mix)."""
-    total = len(re.findall(r'data-ref\s*=\s*"' + re.escape(ref) + r'"', page_block))
-    if total <= 1:
-        return True
-
-    tables = list(_TABLE_RE.finditer(page_block))
-    for tbl in tables:
-        cell_refs = _CELL_RE.findall(tbl.group(0))
-        in_this_table = sum(1 for r in cell_refs if r == ref)
-        # All occurrences of `ref` must be cells of THIS one table.
-        if in_this_table == total:
-            return True
-    return False
-
-
 def _validate_and_normalize_page_block(
     *, page_state: dict[str, Any], page_block: str
 ) -> tuple[str, list[str], list[str]]:
@@ -1096,13 +1069,9 @@ def _validate_and_normalize_page_block(
             hard.append(f"unknown_data_ref: {unknown[:50]}{' ...' if len(unknown) > 50 else ''}")
 
         dup_candidates = [r for r, c in counts.items() if r and c > 1]
-        # A data-ref may legitimately repeat ONLY when it labels one COLUMN of a
-        # single <table>: every occurrence sits on a <td>/<th> cell inside the same
-        # <table>. That is how we align two text nodes row-by-row (Chinese column
-        # data-ref="t2", English column data-ref="t3") via native <tr> rows. Any
-        # other repetition (across two tables, or on non-cell elements, or a mix) is
-        # still a hard error.
-        dup = sorted([r for r in dup_candidates if not _is_table_column_ref(t, r)])
+        # Every editable reference is singular. Native table cells use their own
+        # data-cell-id and never repeat a text data-ref.
+        dup = sorted(dup_candidates)
         if dup:
             hard.append(f"duplicate_data_ref: {dup[:50]}{' ...' if len(dup) > 50 else ''}")
 
