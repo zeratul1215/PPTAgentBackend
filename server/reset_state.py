@@ -1,6 +1,6 @@
 """Wipe all persistent agent state so the system can start clean.
 
-Two independent stores hold state that survives a restart:
+The following state can survive a restart and is handled by this command:
 
 1. Postgres (``PPT_DATABASE_URL``)
    * application tables: ``users`` / ``decks`` / ``sessions`` /
@@ -16,15 +16,16 @@ Two independent stores hold state that survives a restart:
 2. On-disk workspaces under ``agent_backend/result/<project_id>/`` — the
    uploaded PDF/PPTX plus every derived artifact (page PNGs, baseline +
    preview HTML, per-page state, turn history).
+3. Python bytecode caches (``__pycache__/``) under ``agent_backend/``.
 
-This script truncates the Postgres data and (optionally) deletes the on-disk
-workspaces, giving a fresh system. It is destructive and irreversible, so it
-prompts for confirmation unless ``--yes`` is passed.
+This script truncates the Postgres data and deletes the on-disk workspaces and
+Python caches, giving a fresh system. It is destructive and irreversible, so
+it prompts for confirmation unless ``--yes`` is passed.
 
 Usage
 -----
 
-    # wipe DB rows + on-disk result/ workspaces (asks to confirm):
+    # wipe DB rows + on-disk workspaces + Python caches (asks to confirm):
     python -m agent_backend.server.reset_state
 
     # skip the prompt:
@@ -33,7 +34,7 @@ Usage
     # only wipe the database, keep uploaded files on disk:
     python -m agent_backend.server.reset_state --db-only --yes
 
-    # only delete on-disk workspaces, keep the database:
+    # only delete on-disk workspaces + Python caches, keep the database:
     python -m agent_backend.server.reset_state --files-only --yes
 
     # preview what would happen, change nothing:
@@ -45,10 +46,13 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+from pathlib import Path
 
 from agent_backend.workspace.db import database_url, get_pool
 from agent_backend.workspace.env import load_dotenv
 from agent_backend.workspace.paths import DEFAULT_RESULTS_ROOT, DEFAULT_SESSION_RESOURCES_ROOT
+
+_AGENT_BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 # Load agent_backend/.env so PPT_DATABASE_URL etc. are available even when the
 # process was started without exporting them by hand.
@@ -132,22 +136,21 @@ def reset_database(*, dry_run: bool) -> bool:
 
 
 def reset_files(*, dry_run: bool) -> None:
-    """Delete every per-project workspace under ``result/``."""
+    """Delete workspaces, session resources, and Python bytecode caches."""
     root = DEFAULT_RESULTS_ROOT
-    if not root.exists():
+    if root.exists():
+        projects = [p for p in root.iterdir() if p.is_dir()]
+        print(f"[reset] workspaces under {root}: {len(projects)} project(s)")
+        for p in projects:
+            print(f"[reset]   - {p.name}")
+        if dry_run:
+            print("[reset] dry-run: no files deleted.")
+        else:
+            for p in projects:
+                shutil.rmtree(p, ignore_errors=True)
+            print(f"[reset] deleted {len(projects)} workspace(s).")
+    else:
         print(f"[reset] no workspace dir at {root}; skipping files.")
-        return
-
-    projects = [p for p in root.iterdir() if p.is_dir()]
-    print(f"[reset] workspaces under {root}: {len(projects)} project(s)")
-    for p in projects:
-        print(f"[reset]   - {p.name}")
-    if dry_run:
-        print("[reset] dry-run: no files deleted.")
-        return
-    for p in projects:
-        shutil.rmtree(p, ignore_errors=True)
-    print(f"[reset] deleted {len(projects)} workspace(s).")
 
     resource_root = DEFAULT_SESSION_RESOURCES_ROOT
     if resource_root.exists():
@@ -157,6 +160,22 @@ def reset_files(*, dry_run: bool) -> None:
         else:
             shutil.rmtree(resource_root, ignore_errors=True)
             print("[reset] deleted session resource root.")
+
+    cache_dirs = [
+        p for p in _AGENT_BACKEND_ROOT.rglob("__pycache__") if p.is_dir()
+    ]
+    print(
+        f"[reset] Python caches under {_AGENT_BACKEND_ROOT}: "
+        f"{len(cache_dirs)} director(y/ies)"
+    )
+    if dry_run:
+        for p in cache_dirs:
+            print(f"[reset]   - {p.relative_to(_AGENT_BACKEND_ROOT)}")
+        print("[reset] dry-run: Python caches preserved.")
+    else:
+        for p in cache_dirs:
+            shutil.rmtree(p, ignore_errors=True)
+        print(f"[reset] deleted {len(cache_dirs)} Python cache director(y/ies).")
 
 
 def _confirm(prompt: str) -> bool:
@@ -185,7 +204,10 @@ def main(argv: list[str] | None = None) -> int:
     if do_db:
         targets.append("Postgres data (users/decks/sessions/turns/deck styles/style templates + chat checkpoints)")
     if do_files:
-        targets.append(f"on-disk workspaces under {DEFAULT_RESULTS_ROOT} and session resources under {DEFAULT_SESSION_RESOURCES_ROOT}")
+        targets.append(
+            f"on-disk workspaces under {DEFAULT_RESULTS_ROOT}, session resources under "
+            f"{DEFAULT_SESSION_RESOURCES_ROOT}, and Python caches under {_AGENT_BACKEND_ROOT}"
+        )
     print("[reset] this will permanently delete:")
     for t in targets:
         print(f"[reset]   * {t}")
